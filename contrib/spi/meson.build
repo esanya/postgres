@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 autoinc_sources = files(
   'autoinc.c',
 )
@@ -16,6 +18,10 @@ contrib_targets += autoinc
 
 install_data('autoinc.control', 'autoinc--1.0.sql',
   kwargs: contrib_data_args,
+)
+
+install_data('autoinc.example',
+  kwargs: contrib_doc_args,
 )
 
 
@@ -41,6 +47,10 @@ install_data(
   kwargs: contrib_data_args,
 )
 
+install_data('insert_username.example',
+  kwargs: contrib_doc_args,
+)
+
 
 moddatetime_sources = files(
   'moddatetime.c',
@@ -63,6 +73,11 @@ install_data(
   'moddatetime--1.0.sql',
   kwargs: contrib_data_args,
 )
+
+install_data('moddatetime.example',
+  kwargs: contrib_doc_args,
+)
+
 
 # this is needed for the regression tests;
 # comment out if you want a quieter refint package for other uses
@@ -87,4 +102,8 @@ contrib_targets += refint
 
 install_data('refint.control', 'refint--1.0.sql',
   kwargs: contrib_data_args,
+)
+
+install_data('refint.example',
+  kwargs: contrib_doc_args,
 )

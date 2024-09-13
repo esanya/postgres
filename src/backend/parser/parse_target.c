@@ -3,7 +3,7 @@
  * parse_target.c
  *	  handle target lists
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "funcapi.h"
@@ -22,7 +23,6 @@
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_expr.h"
-#include "parser/parse_func.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
@@ -30,7 +30,6 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/typcache.h"
 
 static void markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
 								 Var *var, int levelsup);
@@ -420,6 +419,9 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
 				tle->resorigtbl = ste->resorigtbl;
 				tle->resorigcol = ste->resorigcol;
 			}
+			break;
+		case RTE_GROUP:
+			/* We couldn't get here: the RTE_GROUP RTE has not been added */
 			break;
 	}
 }
@@ -821,7 +823,16 @@ transformAssignmentIndirection(ParseState *pstate,
 			fstore->fieldnums = list_make1_int(attnum);
 			fstore->resulttype = baseTypeId;
 
-			/* If target is a domain, apply constraints */
+			/*
+			 * If target is a domain, apply constraints.  Notice that this
+			 * isn't totally right: the expression tree we build would check
+			 * the domain's constraints on a composite value with only this
+			 * one field populated or updated, possibly leading to an unwanted
+			 * failure.  The rewriter will merge together any subfield
+			 * assignments to the same table column, resulting in the domain's
+			 * constraints being checked only once after we've assigned to all
+			 * the fields that the INSERT or UPDATE means to.
+			 */
 			if (baseTypeId != targetTypeId)
 				return coerce_to_domain((Node *) fstore,
 										baseTypeId, baseTypeMod,
@@ -967,7 +978,12 @@ transformAssignmentSubscripts(ParseState *pstate,
 
 	result = (Node *) sbsref;
 
-	/* If target was a domain over container, need to coerce up to the domain */
+	/*
+	 * If target was a domain over container, need to coerce up to the domain.
+	 * As in transformAssignmentIndirection, this coercion is premature if the
+	 * query assigns to multiple elements of the container; but we'll fix that
+	 * during query rewrite.
+	 */
 	if (containerType != targetTypeId)
 	{
 		Oid			resulttype = exprType(result);
@@ -1132,7 +1148,7 @@ ExpandColumnRefStar(ParseState *pstate, ColumnRef *cref,
 		 *
 		 * Note: this code is a lot like transformColumnRef; it's tempting to
 		 * call that instead and then replace the resulting whole-row Var with
-		 * a list of Vars.  However, that would leave us with the RTE's
+		 * a list of Vars.  However, that would leave us with the relation's
 		 * selectedCols bitmap showing the whole row as needing select
 		 * permission, as well as the individual columns.  That would be
 		 * incorrect (since columns added later shouldn't need select
@@ -1367,10 +1383,11 @@ ExpandSingleTable(ParseState *pstate, ParseNamespaceItem *nsitem,
 	else
 	{
 		RangeTblEntry *rte = nsitem->p_rte;
+		RTEPermissionInfo *perminfo = nsitem->p_perminfo;
 		List	   *vars;
 		ListCell   *l;
 
-		vars = expandNSItemVars(nsitem, sublevels_up, location, NULL);
+		vars = expandNSItemVars(pstate, nsitem, sublevels_up, location, NULL);
 
 		/*
 		 * Require read access to the table.  This is normally redundant with
@@ -1381,7 +1398,10 @@ ExpandSingleTable(ParseState *pstate, ParseNamespaceItem *nsitem,
 		 * target relation of UPDATE/DELETE, which cannot be under a join.)
 		 */
 		if (rte->rtekind == RTE_RELATION)
-			rte->requiredPerms |= ACL_SELECT;
+		{
+			Assert(perminfo != NULL);
+			perminfo->requiredPerms |= ACL_SELECT;
+		}
 
 		/* Require read access to each column */
 		foreach(l, vars)
@@ -1414,11 +1434,11 @@ ExpandRowReference(ParseState *pstate, Node *expr,
 	/*
 	 * If the rowtype expression is a whole-row Var, we can expand the fields
 	 * as simple Vars.  Note: if the RTE is a relation, this case leaves us
-	 * with the RTE's selectedCols bitmap showing the whole row as needing
-	 * select permission, as well as the individual columns.  However, we can
-	 * only get here for weird notations like (table.*).*, so it's not worth
-	 * trying to clean up --- arguably, the permissions marking is correct
-	 * anyway for such cases.
+	 * with its RTEPermissionInfo's selectedCols bitmap showing the whole row
+	 * as needing select permission, as well as the individual columns.
+	 * However, we can only get here for weird notations like (table.*).*, so
+	 * it's not worth trying to clean up --- arguably, the permissions marking
+	 * is correct anyway for such cases.
 	 */
 	if (IsA(expr, Var) &&
 		((Var *) expr)->varattno == InvalidAttrNumber)
@@ -1495,7 +1515,8 @@ ExpandRowReference(ParseState *pstate, Node *expr,
  * drill down to find the ultimate defining expression and attempt to infer
  * the tupdesc from it.  We ereport if we can't determine the tupdesc.
  *
- * levelsup is an extra offset to interpret the Var's varlevelsup correctly.
+ * levelsup is an extra offset to interpret the Var's varlevelsup correctly
+ * when recursing.  Outside callers should pass zero.
  */
 TupleDesc
 expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
@@ -1583,10 +1604,17 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 					/*
 					 * Recurse into the sub-select to see what its Var refers
 					 * to.  We have to build an additional level of ParseState
-					 * to keep in step with varlevelsup in the subselect.
+					 * to keep in step with varlevelsup in the subselect;
+					 * furthermore, the subquery RTE might be from an outer
+					 * query level, in which case the ParseState for the
+					 * subselect must have that outer level as parent.
 					 */
 					ParseState	mypstate = {0};
+					Index		levelsup;
 
+					/* this loop must work, since GetRTEByRangeTablePosn did */
+					for (levelsup = 0; levelsup < netlevelsup; levelsup++)
+						pstate = pstate->parentParseState;
 					mypstate.parentParseState = pstate;
 					mypstate.p_rtable = rte->subquery->rtable;
 					/* don't bother filling the rest of the fake pstate */
@@ -1637,12 +1665,11 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 					 * Recurse into the CTE to see what its Var refers to. We
 					 * have to build an additional level of ParseState to keep
 					 * in step with varlevelsup in the CTE; furthermore it
-					 * could be an outer CTE.
+					 * could be an outer CTE (compare SUBQUERY case above).
 					 */
-					ParseState	mypstate;
+					ParseState	mypstate = {0};
 					Index		levelsup;
 
-					MemSet(&mypstate, 0, sizeof(mypstate));
 					/* this loop must work, since GetCTEForRTE did */
 					for (levelsup = 0;
 						 levelsup < rte->ctelevelsup + netlevelsup;
@@ -1656,6 +1683,12 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 				}
 				/* else fall through to inspect the expression */
 			}
+			break;
+		case RTE_GROUP:
+
+			/*
+			 * We couldn't get here: the RTE_GROUP RTE has not been added.
+			 */
 			break;
 	}
 
@@ -1795,6 +1828,10 @@ FigureColnameInternal(Node *node, char **name)
 		case T_GroupingFunc:
 			/* make GROUPING() act like a regular function */
 			*name = "grouping";
+			return 2;
+		case T_MergeSupportFunc:
+			/* make MERGE_ACTION() act like a regular function */
+			*name = "merge_action";
 			return 2;
 		case T_SubLink:
 			switch (((SubLink *) node)->subLinkType)
@@ -1946,8 +1983,57 @@ FigureColnameInternal(Node *node, char **name)
 			}
 			break;
 		case T_XmlSerialize:
+			/* make XMLSERIALIZE act like a regular function */
 			*name = "xmlserialize";
 			return 2;
+		case T_JsonParseExpr:
+			/* make JSON act like a regular function */
+			*name = "json";
+			return 2;
+		case T_JsonScalarExpr:
+			/* make JSON_SCALAR act like a regular function */
+			*name = "json_scalar";
+			return 2;
+		case T_JsonSerializeExpr:
+			/* make JSON_SERIALIZE act like a regular function */
+			*name = "json_serialize";
+			return 2;
+		case T_JsonObjectConstructor:
+			/* make JSON_OBJECT act like a regular function */
+			*name = "json_object";
+			return 2;
+		case T_JsonArrayConstructor:
+		case T_JsonArrayQueryConstructor:
+			/* make JSON_ARRAY act like a regular function */
+			*name = "json_array";
+			return 2;
+		case T_JsonObjectAgg:
+			/* make JSON_OBJECTAGG act like a regular function */
+			*name = "json_objectagg";
+			return 2;
+		case T_JsonArrayAgg:
+			/* make JSON_ARRAYAGG act like a regular function */
+			*name = "json_arrayagg";
+			return 2;
+		case T_JsonFuncExpr:
+			/* make SQL/JSON functions act like a regular function */
+			switch (((JsonFuncExpr *) node)->op)
+			{
+				case JSON_EXISTS_OP:
+					*name = "json_exists";
+					return 2;
+				case JSON_QUERY_OP:
+					*name = "json_query";
+					return 2;
+				case JSON_VALUE_OP:
+					*name = "json_value";
+					return 2;
+					/* JSON_TABLE_OP can't happen here. */
+				default:
+					elog(ERROR, "unrecognized JsonExpr op: %d",
+						 (int) ((JsonFuncExpr *) node)->op);
+			}
+			break;
 		default:
 			break;
 	}

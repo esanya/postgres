@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 psql_sources = files(
   'command.c',
   'common.c',

@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 pg_config_ext = configure_file(
   input: 'pg_config_ext.h.meson',
   output: 'pg_config_ext.h',
@@ -42,15 +44,21 @@ config_paths_data.set_quoted('MANDIR', dir_prefix / dir_man)
 
 var_cc = ' '.join(cc.cmd_array())
 var_cpp = ' '.join(cc.cmd_array() + ['-E'])
-var_cflags = ' '.join(cflags + cflags_warn + get_option('c_args'))
+var_cflags = ' '.join(cflags + cflags_builtin + cflags_warn + get_option('c_args'))
 if llvm.found()
-  var_cxxflags = ' '.join(cxxflags + cxxflags_warn + get_option('cpp_args'))
+  var_cxxflags = ' '.join(cxxflags + cxxflags_builtin + cxxflags_warn + get_option('cpp_args'))
 else
   var_cxxflags = ''
 endif
 var_cppflags = ' '.join(cppflags)
-var_cflags_sl = '-fPIC' #FIXME
-var_ldflags = ' '.join(ldflags + get_option('c_link_args'))
+var_cflags_sl = ' '.join(cc.get_supported_arguments('-fPIC'))
+# explicitly add -Wl,--as-needed, normally added by meson, but we want it for
+# PGXS compatibility
+var_ldflags = ' '.join(
+  ldflags
+  + cc.get_supported_link_arguments('-Wl,--as-needed')
+  + get_option('c_link_args')
+)
 var_ldflags_sl = ''.join(ldflags_sl)
 var_ldflags_ex = '' # FIXME
 # FIXME - some extensions might directly use symbols from one of libs. If
@@ -81,11 +89,12 @@ install_headers(
   'c.h',
   'port.h',
   'postgres_fe.h',
-  install_dir: dir_include_internal
+  install_dir: dir_include_internal,
 )
 
 install_headers(
   'libpq/pqcomm.h',
+  'libpq/protocol.h',
   install_dir: dir_include_internal / 'libpq',
 )
 
@@ -105,6 +114,7 @@ install_headers(
   'postgres.h',
   'postgres_ext.h',
   'postgres_fe.h',
+  'varatt.h',
   'windowapi.h',
   pg_config_ext,
   pg_config_os,
@@ -120,6 +130,7 @@ subdir('utils')
 
 header_subdirs = [
   'access',
+  'archive',
   'catalog',
   'bootstrap',
   'commands',

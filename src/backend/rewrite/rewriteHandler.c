@@ -3,7 +3,7 @@
  * rewriteHandler.c
  *		Primary module of query rewriter.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -24,8 +24,8 @@
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/dependency.h"
-#include "catalog/pg_type.h"
 #include "commands/trigger.h"
+#include "executor/executor.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -40,6 +40,7 @@
 #include "rewrite/rewriteManip.h"
 #include "rewrite/rewriteSearchCycle.h"
 #include "rewrite/rowsecurity.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -85,10 +86,9 @@ static void rewriteValuesRTEToNulls(Query *parsetree, RangeTblEntry *rte);
 static void markQueryForLocking(Query *qry, Node *jtnode,
 								LockClauseStrength strength, LockWaitPolicy waitPolicy,
 								bool pushedDown);
-static List *matchLocks(CmdType event, RuleLock *rulelocks,
+static List *matchLocks(CmdType event, Relation relation,
 						int varno, Query *parsetree, bool *hasUpdate);
 static Query *fireRIRrules(Query *parsetree, List *activeRIRs);
-static bool view_has_instead_trigger(Relation view, CmdType event);
 static Bitmapset *adjust_view_column_set(Bitmapset *cols, List *targetlist);
 
 
@@ -353,6 +353,7 @@ rewriteRuleAction(Query *parsetree,
 	Query	   *sub_action;
 	Query	  **sub_action_ptr;
 	acquireLocksOnSubLinks_context context;
+	ListCell   *lc;
 
 	context.for_execute = true;
 
@@ -392,35 +393,63 @@ rewriteRuleAction(Query *parsetree,
 				   PRS2_OLD_VARNO + rt_length, rt_index, 0);
 
 	/*
+	 * Mark any subquery RTEs in the rule action as LATERAL if they contain
+	 * Vars referring to the current query level (references to NEW/OLD).
+	 * Those really are lateral references, but we've historically not
+	 * required users to mark such subqueries with LATERAL explicitly.  But
+	 * the planner will complain if such Vars exist in a non-LATERAL subquery,
+	 * so we have to fix things up here.
+	 */
+	foreach(lc, sub_action->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && !rte->lateral &&
+			contain_vars_of_level((Node *) rte->subquery, 1))
+			rte->lateral = true;
+	}
+
+	/*
 	 * Generate expanded rtable consisting of main parsetree's rtable plus
 	 * rule action's rtable; this becomes the complete rtable for the rule
 	 * action.  Some of the entries may be unused after we finish rewriting,
-	 * but we leave them all in place for two reasons:
+	 * but we leave them all in place to avoid having to adjust the query's
+	 * varnos.  RT entries that are not referenced in the completed jointree
+	 * will be ignored by the planner, so they do not affect query semantics.
 	 *
-	 * We'd have a much harder job to adjust the query's varnos if we
-	 * selectively removed RT entries.
+	 * Also merge RTEPermissionInfo lists to ensure that all permissions are
+	 * checked correctly.
 	 *
 	 * If the rule is INSTEAD, then the original query won't be executed at
-	 * all, and so its rtable must be preserved so that the executor will do
-	 * the correct permissions checks on it.
+	 * all, and so its rteperminfos must be preserved so that the executor
+	 * will do the correct permissions checks on the relations referenced in
+	 * it. This allows us to check that the caller has, say, insert-permission
+	 * on a view, when the view is not semantically referenced at all in the
+	 * resulting query.
 	 *
-	 * RT entries that are not referenced in the completed jointree will be
-	 * ignored by the planner, so they do not affect query semantics.  But any
-	 * permissions checks specified in them will be applied during executor
-	 * startup (see ExecCheckRTEPerms()).  This allows us to check that the
-	 * caller has, say, insert-permission on a view, when the view is not
-	 * semantically referenced at all in the resulting query.
+	 * When a rule is not INSTEAD, the permissions checks done using the
+	 * copied entries will be redundant with those done during execution of
+	 * the original query, but we don't bother to treat that case differently.
 	 *
-	 * When a rule is not INSTEAD, the permissions checks done on its copied
-	 * RT entries will be redundant with those done during execution of the
-	 * original query, but we don't bother to treat that case differently.
-	 *
-	 * NOTE: because planner will destructively alter rtable, we must ensure
-	 * that rule action's rtable is separate and shares no substructure with
-	 * the main rtable.  Hence do a deep copy here.
+	 * NOTE: because planner will destructively alter rtable and rteperminfos,
+	 * we must ensure that rule action's lists are separate and shares no
+	 * substructure with the main query's lists.  Hence do a deep copy here
+	 * for both.
 	 */
-	sub_action->rtable = list_concat(copyObject(parsetree->rtable),
-									 sub_action->rtable);
+	{
+		List	   *rtable_tail = sub_action->rtable;
+		List	   *perminfos_tail = sub_action->rteperminfos;
+
+		/*
+		 * RewriteQuery relies on the fact that RT entries from the original
+		 * query appear at the start of the expanded rtable, so we put the
+		 * action's original table at the end of the list.
+		 */
+		sub_action->rtable = copyObject(parsetree->rtable);
+		sub_action->rteperminfos = copyObject(parsetree->rteperminfos);
+		CombineRangeTables(&sub_action->rtable, &sub_action->rteperminfos,
+						   rtable_tail, perminfos_tail);
+	}
 
 	/*
 	 * There could have been some SubLinks in parsetree's rtable, in which
@@ -428,8 +457,6 @@ rewriteRuleAction(Query *parsetree,
 	 */
 	if (parsetree->hasSubLinks && !sub_action->hasSubLinks)
 	{
-		ListCell   *lc;
-
 		foreach(lc, parsetree->rtable)
 		{
 			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
@@ -456,6 +483,8 @@ rewriteRuleAction(Query *parsetree,
 					/* other RTE types don't contain bare expressions */
 					break;
 			}
+			sub_action->hasSubLinks |=
+				checkExprHasSubLink((Node *) rte->securityQuals);
 			if (sub_action->hasSubLinks)
 				break;			/* no need to keep scanning rtable */
 		}
@@ -527,8 +556,6 @@ rewriteRuleAction(Query *parsetree,
 	 */
 	if (parsetree->cteList != NIL && sub_action->commandType != CMD_UTILITY)
 	{
-		ListCell   *lc;
-
 		/*
 		 * Annoying implementation restriction: because CTEs are identified by
 		 * name within a cteList, we can't merge a CTE from the original query
@@ -1059,9 +1086,9 @@ process_matched_tle(TargetEntry *src_tle,
 	 * resulting in each assignment containing a CoerceToDomain node over a
 	 * FieldStore or SubscriptingRef.  These should have matching target
 	 * domains, so we strip them and reconstitute a single CoerceToDomain over
-	 * the combined FieldStore/SubscriptingRef nodes.  (Notice that this has the
-	 * result that the domain's checks are applied only after we do all the
-	 * field or element updates, not after each one.  This is arguably desirable.)
+	 * the combined FieldStore/SubscriptingRef nodes.  (Notice that this has
+	 * the result that the domain's checks are applied only after we do all
+	 * the field or element updates, not after each one.  This is desirable.)
 	 *----------
 	 */
 	src_expr = (Node *) src_tle->expr;
@@ -1207,7 +1234,7 @@ build_column_default(Relation rel, int attrno)
 	{
 		NextValueExpr *nve = makeNode(NextValueExpr);
 
-		nve->seqid = getIdentitySequence(RelationGetRelid(rel), attrno, false);
+		nve->seqid = getIdentitySequence(rel, attrno, false);
 		nve->typeId = att_tup->atttypid;
 
 		return (Node *) nve;
@@ -1218,21 +1245,7 @@ build_column_default(Relation rel, int attrno)
 	 */
 	if (att_tup->atthasdef)
 	{
-		if (rd_att->constr && rd_att->constr->num_defval > 0)
-		{
-			AttrDefault *defval = rd_att->constr->defval;
-			int			ndef = rd_att->constr->num_defval;
-
-			while (--ndef >= 0)
-			{
-				if (attrno == defval[ndef].adnum)
-				{
-					/* Found it, convert string representation to node tree. */
-					expr = stringToNode(defval[ndef].adbin);
-					break;
-				}
-			}
-		}
+		expr = TupleDescGetDefault(rd_att, attrno);
 		if (expr == NULL)
 			elog(ERROR, "default expression not found for attribute %d of relation \"%s\"",
 				 attrno, RelationGetRelationName(rel));
@@ -1451,7 +1464,7 @@ rewriteValuesRTE(Query *parsetree, RangeTblEntry *rte, int rti,
 	 */
 	isAutoUpdatableView = false;
 	if (target_relation->rd_rel->relkind == RELKIND_VIEW &&
-		!view_has_instead_trigger(target_relation, CMD_INSERT))
+		!view_has_instead_trigger(target_relation, CMD_INSERT, NIL))
 	{
 		List	   *locks;
 		bool		hasUpdate;
@@ -1459,7 +1472,7 @@ rewriteValuesRTE(Query *parsetree, RangeTblEntry *rte, int rti,
 		ListCell   *l;
 
 		/* Look for an unconditional DO INSTEAD rule */
-		locks = matchLocks(CMD_INSERT, target_relation->rd_rules,
+		locks = matchLocks(CMD_INSERT, target_relation,
 						   parsetree->resultRelation, parsetree, &hasUpdate);
 
 		found = false;
@@ -1593,7 +1606,6 @@ rewriteValuesRTEToNulls(Query *parsetree, RangeTblEntry *rte)
 	List	   *newValues;
 	ListCell   *lc;
 
-	Assert(rte->rtekind == RTE_VALUES);
 	newValues = NIL;
 	foreach(lc, rte->values_lists)
 	{
@@ -1623,62 +1635,22 @@ rewriteValuesRTEToNulls(Query *parsetree, RangeTblEntry *rte)
 
 
 /*
- * Record in target_rte->extraUpdatedCols the indexes of any generated columns
- * that depend on any columns mentioned in target_rte->updatedCols.
- */
-void
-fill_extraUpdatedCols(RangeTblEntry *target_rte, Relation target_relation)
-{
-	TupleDesc	tupdesc = RelationGetDescr(target_relation);
-	TupleConstr *constr = tupdesc->constr;
-
-	target_rte->extraUpdatedCols = NULL;
-
-	if (constr && constr->has_generated_stored)
-	{
-		for (int i = 0; i < constr->num_defval; i++)
-		{
-			AttrDefault *defval = &constr->defval[i];
-			Node	   *expr;
-			Bitmapset  *attrs_used = NULL;
-
-			/* skip if not generated column */
-			if (!TupleDescAttr(tupdesc, defval->adnum - 1)->attgenerated)
-				continue;
-
-			/* identify columns this generated column depends on */
-			expr = stringToNode(defval->adbin);
-			pull_varattnos(expr, 1, &attrs_used);
-
-			if (bms_overlap(target_rte->updatedCols, attrs_used))
-				target_rte->extraUpdatedCols =
-					bms_add_member(target_rte->extraUpdatedCols,
-								   defval->adnum - FirstLowInvalidHeapAttributeNumber);
-		}
-	}
-}
-
-
-/*
  * matchLocks -
- *	  match the list of locks and returns the matching rules
+ *	  match a relation's list of locks and returns the matching rules
  */
 static List *
 matchLocks(CmdType event,
-		   RuleLock *rulelocks,
+		   Relation relation,
 		   int varno,
 		   Query *parsetree,
 		   bool *hasUpdate)
 {
+	RuleLock   *rulelocks = relation->rd_rules;
 	List	   *matching_locks = NIL;
 	int			nlocks;
 	int			i;
 
 	if (rulelocks == NULL)
-		return NIL;
-
-	/* No rule support for MERGE */
-	if (parsetree->commandType == CMD_MERGE)
 		return NIL;
 
 	if (parsetree->commandType != CMD_SELECT)
@@ -1698,7 +1670,7 @@ matchLocks(CmdType event,
 
 		/*
 		 * Suppress ON INSERT/UPDATE/DELETE rules that are disabled or
-		 * configured to not fire during the current sessions replication
+		 * configured to not fire during the current session's replication
 		 * role. ON SELECT rules will always be applied in order to keep views
 		 * working even in LOCAL or REPLICA role.
 		 */
@@ -1716,6 +1688,14 @@ matchLocks(CmdType event,
 					oneLock->enabled == RULE_DISABLED)
 					continue;
 			}
+
+			/* Non-SELECT rules are not supported for MERGE */
+			if (parsetree->commandType == CMD_MERGE)
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot execute MERGE on relation \"%s\"",
+							   RelationGetRelationName(relation)),
+						errdetail("MERGE is not supported for relations with rules."));
 		}
 
 		if (oneLock->event == event)
@@ -1741,14 +1721,22 @@ ApplyRetrieveRule(Query *parsetree,
 				  List *activeRIRs)
 {
 	Query	   *rule_action;
-	RangeTblEntry *rte,
-			   *subrte;
+	RangeTblEntry *rte;
 	RowMarkClause *rc;
+	int			numCols;
 
 	if (list_length(rule->actions) != 1)
 		elog(ERROR, "expected just one rule action");
 	if (rule->qual != NULL)
 		elog(ERROR, "cannot handle qualified ON SELECT rule");
+
+	/* Check if the expansion of non-system views are restricted */
+	if (unlikely((restrict_nonsystem_relation_kind & RESTRICT_RELKIND_VIEW) != 0 &&
+				 RelationGetRelid(relation) >= FirstNormalObjectId))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("access to non-system view \"%s\" is restricted",
+						RelationGetRelationName(relation))));
 
 	if (rt_index == parsetree->resultRelation)
 	{
@@ -1762,9 +1750,9 @@ ApplyRetrieveRule(Query *parsetree,
 		 * For INSERT, we needn't do anything.  The unmodified RTE will serve
 		 * fine as the result relation.
 		 *
-		 * For UPDATE/DELETE, we need to expand the view so as to have source
-		 * data for the operation.  But we also need an unmodified RTE to
-		 * serve as the target.  So, copy the RTE and add the copy to the
+		 * For UPDATE/DELETE/MERGE, we need to expand the view so as to have
+		 * source data for the operation.  But we also need an unmodified RTE
+		 * to serve as the target.  So, copy the RTE and add the copy to the
 		 * rangetable.  Note that the copy does not get added to the jointree.
 		 * Also note that there's a hack in fireRIRrules to avoid calling this
 		 * function again when it arrives at the copied RTE.
@@ -1772,7 +1760,8 @@ ApplyRetrieveRule(Query *parsetree,
 		if (parsetree->commandType == CMD_INSERT)
 			return parsetree;
 		else if (parsetree->commandType == CMD_UPDATE ||
-				 parsetree->commandType == CMD_DELETE)
+				 parsetree->commandType == CMD_DELETE ||
+				 parsetree->commandType == CMD_MERGE)
 		{
 			RangeTblEntry *newrte;
 			Var		   *var;
@@ -1782,18 +1771,7 @@ ApplyRetrieveRule(Query *parsetree,
 			newrte = copyObject(rte);
 			parsetree->rtable = lappend(parsetree->rtable, newrte);
 			parsetree->resultRelation = list_length(parsetree->rtable);
-
-			/*
-			 * There's no need to do permissions checks twice, so wipe out the
-			 * permissions info for the original RTE (we prefer to keep the
-			 * bits set on the result RTE).
-			 */
-			rte->requiredPerms = 0;
-			rte->checkAsUser = InvalidOid;
-			rte->selectedCols = NULL;
-			rte->insertedCols = NULL;
-			rte->updatedCols = NULL;
-			rte->extraUpdatedCols = NULL;
+			/* parsetree->mergeTargetRelation unchanged (use expanded view) */
 
 			/*
 			 * For the most part, Vars referencing the view should remain as
@@ -1858,12 +1836,6 @@ ApplyRetrieveRule(Query *parsetree,
 
 	/*
 	 * Recursively expand any view references inside the view.
-	 *
-	 * Note: this must happen after markQueryForLocking.  That way, any UPDATE
-	 * permission bits needed for sub-views are initially applied to their
-	 * RTE_RELATION RTEs by markQueryForLocking, and then transferred to their
-	 * OLD rangetable entries by the action below (in a recursive call of this
-	 * routine).
 	 */
 	rule_action = fireRIRrules(rule_action, activeRIRs);
 
@@ -1876,32 +1848,29 @@ ApplyRetrieveRule(Query *parsetree,
 	rte->rtekind = RTE_SUBQUERY;
 	rte->subquery = rule_action;
 	rte->security_barrier = RelationIsSecurityView(relation);
-	/* Clear fields that should not be set in a subquery RTE */
-	rte->relid = InvalidOid;
-	rte->relkind = 0;
-	rte->rellockmode = 0;
+
+	/*
+	 * Clear fields that should not be set in a subquery RTE.  Note that we
+	 * leave the relid, relkind, rellockmode, and perminfoindex fields set, so
+	 * that the view relation can be appropriately locked before execution and
+	 * its permissions checked.
+	 */
 	rte->tablesample = NULL;
 	rte->inh = false;			/* must not be set for a subquery */
 
 	/*
-	 * We move the view's permission check data down to its rangetable. The
-	 * checks will actually be done against the OLD entry therein.
+	 * Since we allow CREATE OR REPLACE VIEW to add columns to a view, the
+	 * rule_action might emit more columns than we expected when the current
+	 * query was parsed.  Various places expect rte->eref->colnames to be
+	 * consistent with the non-junk output columns of the subquery, so patch
+	 * things up if necessary by adding some dummy column names.
 	 */
-	subrte = rt_fetch(PRS2_OLD_VARNO, rule_action->rtable);
-	Assert(subrte->relid == relation->rd_id);
-	subrte->requiredPerms = rte->requiredPerms;
-	subrte->checkAsUser = rte->checkAsUser;
-	subrte->selectedCols = rte->selectedCols;
-	subrte->insertedCols = rte->insertedCols;
-	subrte->updatedCols = rte->updatedCols;
-	subrte->extraUpdatedCols = rte->extraUpdatedCols;
-
-	rte->requiredPerms = 0;		/* no permission check on subquery itself */
-	rte->checkAsUser = InvalidOid;
-	rte->selectedCols = NULL;
-	rte->insertedCols = NULL;
-	rte->updatedCols = NULL;
-	rte->extraUpdatedCols = NULL;
+	numCols = ExecCleanTargetListLength(rule_action->targetList);
+	while (list_length(rte->eref->colnames) < numCols)
+	{
+		rte->eref->colnames = lappend(rte->eref->colnames,
+									  makeString(pstrdup("?column?")));
+	}
 
 	return parsetree;
 }
@@ -1913,9 +1882,10 @@ ApplyRetrieveRule(Query *parsetree,
  * aggregate.  We leave it to the planner to detect that.
  *
  * NB: this must agree with the parser's transformLockingClause() routine.
- * However, unlike the parser we have to be careful not to mark a view's
- * OLD and NEW rels for updating.  The best way to handle that seems to be
- * to scan the jointree to determine which rels are used.
+ * However, we used to have to avoid marking a view's OLD and NEW rels for
+ * updating, which motivated scanning the jointree to determine which rels
+ * are used.  Possibly that could now be simplified into just scanning the
+ * rangetable as the parser does.
  */
 static void
 markQueryForLocking(Query *qry, Node *jtnode,
@@ -1931,8 +1901,12 @@ markQueryForLocking(Query *qry, Node *jtnode,
 
 		if (rte->rtekind == RTE_RELATION)
 		{
+			RTEPermissionInfo *perminfo;
+
 			applyLockingClause(qry, rti, strength, waitPolicy, pushedDown);
-			rte->requiredPerms |= ACL_SELECT_FOR_UPDATE;
+
+			perminfo = getRTEPermissionInfo(qry->rteperminfos, rte);
+			perminfo->requiredPerms |= ACL_SELECT_FOR_UPDATE;
 		}
 		else if (rte->rtekind == RTE_SUBQUERY)
 		{
@@ -2493,9 +2467,15 @@ get_view_query(Relation view)
  * If it does, we don't want to treat it as auto-updatable.  This test can't
  * be folded into view_query_is_auto_updatable because it's not an error
  * condition.
+ *
+ * For MERGE, this will return true if there is an INSTEAD OF trigger for
+ * every action in mergeActionList, and false if there are any actions that
+ * lack an INSTEAD OF trigger.  If there are no data-modifying MERGE actions
+ * (only DO NOTHING actions), true is returned so that the view is treated
+ * as trigger-updatable, rather than erroring out if it's not auto-updatable.
  */
-static bool
-view_has_instead_trigger(Relation view, CmdType event)
+bool
+view_has_instead_trigger(Relation view, CmdType event, List *mergeActionList)
 {
 	TriggerDesc *trigDesc = view->trigdesc;
 
@@ -2513,6 +2493,32 @@ view_has_instead_trigger(Relation view, CmdType event)
 			if (trigDesc && trigDesc->trig_delete_instead_row)
 				return true;
 			break;
+		case CMD_MERGE:
+			foreach_node(MergeAction, action, mergeActionList)
+			{
+				switch (action->commandType)
+				{
+					case CMD_INSERT:
+						if (!trigDesc || !trigDesc->trig_insert_instead_row)
+							return false;
+						break;
+					case CMD_UPDATE:
+						if (!trigDesc || !trigDesc->trig_update_instead_row)
+							return false;
+						break;
+					case CMD_DELETE:
+						if (!trigDesc || !trigDesc->trig_delete_instead_row)
+							return false;
+						break;
+					case CMD_NOTHING:
+						/* No trigger required */
+						break;
+					default:
+						elog(ERROR, "unrecognized commandType: %d", action->commandType);
+						break;
+				}
+			}
+			return true;		/* no actions without an INSTEAD OF trigger */
 		default:
 			elog(ERROR, "unrecognized CmdType: %d", (int) event);
 			break;
@@ -2989,7 +2995,7 @@ relation_is_updatable(Oid reloid,
  *
  * This is used with simply-updatable views to map column-permissions sets for
  * the view columns onto the matching columns in the underlying base relation.
- * The targetlist is expected to be a list of plain Vars of the underlying
+ * Relevant entries in the targetlist must be plain Vars of the underlying
  * relation (as per the checks above in view_query_is_auto_updatable).
  */
 static Bitmapset *
@@ -3054,6 +3060,105 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
 
 
 /*
+ * error_view_not_updatable -
+ *	  Report an error due to an attempt to update a non-updatable view.
+ *
+ * Generally this is expected to be called from the rewriter, with suitable
+ * error detail explaining why the view is not updatable.  Note, however, that
+ * the executor also performs a just-in-case check that the target view is
+ * updatable.  That check is expected to never fail, but if it does, it will
+ * call this function with NULL error detail --- see CheckValidResultRel().
+ *
+ * Note: for MERGE, at least one of the actions in mergeActionList is expected
+ * to lack a suitable INSTEAD OF trigger --- see view_has_instead_trigger().
+ */
+void
+error_view_not_updatable(Relation view,
+						 CmdType command,
+						 List *mergeActionList,
+						 const char *detail)
+{
+	TriggerDesc *trigDesc = view->trigdesc;
+
+	switch (command)
+	{
+		case CMD_INSERT:
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("cannot insert into view \"%s\"",
+						   RelationGetRelationName(view)),
+					detail ? errdetail_internal("%s", _(detail)) : 0,
+					errhint("To enable inserting into the view, provide an INSTEAD OF INSERT trigger or an unconditional ON INSERT DO INSTEAD rule."));
+			break;
+		case CMD_UPDATE:
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("cannot update view \"%s\"",
+						   RelationGetRelationName(view)),
+					detail ? errdetail_internal("%s", _(detail)) : 0,
+					errhint("To enable updating the view, provide an INSTEAD OF UPDATE trigger or an unconditional ON UPDATE DO INSTEAD rule."));
+			break;
+		case CMD_DELETE:
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("cannot delete from view \"%s\"",
+						   RelationGetRelationName(view)),
+					detail ? errdetail_internal("%s", _(detail)) : 0,
+					errhint("To enable deleting from the view, provide an INSTEAD OF DELETE trigger or an unconditional ON DELETE DO INSTEAD rule."));
+			break;
+		case CMD_MERGE:
+
+			/*
+			 * Note that the error hints here differ from above, since MERGE
+			 * doesn't support rules.
+			 */
+			foreach_node(MergeAction, action, mergeActionList)
+			{
+				switch (action->commandType)
+				{
+					case CMD_INSERT:
+						if (!trigDesc || !trigDesc->trig_insert_instead_row)
+							ereport(ERROR,
+									errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+									errmsg("cannot insert into view \"%s\"",
+										   RelationGetRelationName(view)),
+									detail ? errdetail_internal("%s", _(detail)) : 0,
+									errhint("To enable inserting into the view using MERGE, provide an INSTEAD OF INSERT trigger."));
+						break;
+					case CMD_UPDATE:
+						if (!trigDesc || !trigDesc->trig_update_instead_row)
+							ereport(ERROR,
+									errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+									errmsg("cannot update view \"%s\"",
+										   RelationGetRelationName(view)),
+									detail ? errdetail_internal("%s", _(detail)) : 0,
+									errhint("To enable updating the view using MERGE, provide an INSTEAD OF UPDATE trigger."));
+						break;
+					case CMD_DELETE:
+						if (!trigDesc || !trigDesc->trig_delete_instead_row)
+							ereport(ERROR,
+									errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+									errmsg("cannot delete from view \"%s\"",
+										   RelationGetRelationName(view)),
+									detail ? errdetail_internal("%s", _(detail)) : 0,
+									errhint("To enable deleting from the view using MERGE, provide an INSTEAD OF DELETE trigger."));
+						break;
+					case CMD_NOTHING:
+						break;
+					default:
+						elog(ERROR, "unrecognized commandType: %d", action->commandType);
+						break;
+				}
+			}
+			break;
+		default:
+			elog(ERROR, "unrecognized CmdType: %d", (int) command);
+			break;
+	}
+}
+
+
+/*
  * rewriteTargetView -
  *	  Attempt to rewrite a query where the target relation is a view, so that
  *	  the view's base relation becomes the target relation.
@@ -3066,6 +3171,7 @@ static Query *
 rewriteTargetView(Query *parsetree, Relation view)
 {
 	Query	   *viewquery;
+	bool		insert_or_update;
 	const char *auto_update_detail;
 	RangeTblRef *rtr;
 	int			base_rt_index;
@@ -3073,6 +3179,9 @@ rewriteTargetView(Query *parsetree, Relation view)
 	RangeTblEntry *base_rte;
 	RangeTblEntry *view_rte;
 	RangeTblEntry *new_rte;
+	RTEPermissionInfo *base_perminfo;
+	RTEPermissionInfo *view_perminfo;
+	RTEPermissionInfo *new_perminfo;
 	Relation	base_rel;
 	List	   *view_targetlist;
 	ListCell   *lc;
@@ -3086,58 +3195,76 @@ rewriteTargetView(Query *parsetree, Relation view)
 	 */
 	viewquery = copyObject(get_view_query(view));
 
-	/* The view must be updatable, else fail */
-	auto_update_detail =
-		view_query_is_auto_updatable(viewquery,
-									 parsetree->commandType != CMD_DELETE);
+	/* Locate RTE and perminfo describing the view in the outer query */
+	view_rte = rt_fetch(parsetree->resultRelation, parsetree->rtable);
+	view_perminfo = getRTEPermissionInfo(parsetree->rteperminfos, view_rte);
 
-	if (auto_update_detail)
+	/*
+	 * Are we doing INSERT/UPDATE, or MERGE containing INSERT/UPDATE?  If so,
+	 * various additional checks on the view columns need to be applied, and
+	 * any view CHECK OPTIONs need to be enforced.
+	 */
+	insert_or_update =
+		(parsetree->commandType == CMD_INSERT ||
+		 parsetree->commandType == CMD_UPDATE);
+
+	if (parsetree->commandType == CMD_MERGE)
 	{
-		/* messages here should match execMain.c's CheckValidResultRel */
-		switch (parsetree->commandType)
+		foreach_node(MergeAction, action, parsetree->mergeActionList)
 		{
-			case CMD_INSERT:
-				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("cannot insert into view \"%s\"",
-								RelationGetRelationName(view)),
-						 errdetail_internal("%s", _(auto_update_detail)),
-						 errhint("To enable inserting into the view, provide an INSTEAD OF INSERT trigger or an unconditional ON INSERT DO INSTEAD rule.")));
+			if (action->commandType == CMD_INSERT ||
+				action->commandType == CMD_UPDATE)
+			{
+				insert_or_update = true;
 				break;
-			case CMD_UPDATE:
-				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("cannot update view \"%s\"",
-								RelationGetRelationName(view)),
-						 errdetail_internal("%s", _(auto_update_detail)),
-						 errhint("To enable updating the view, provide an INSTEAD OF UPDATE trigger or an unconditional ON UPDATE DO INSTEAD rule.")));
-				break;
-			case CMD_DELETE:
-				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("cannot delete from view \"%s\"",
-								RelationGetRelationName(view)),
-						 errdetail_internal("%s", _(auto_update_detail)),
-						 errhint("To enable deleting from the view, provide an INSTEAD OF DELETE trigger or an unconditional ON DELETE DO INSTEAD rule.")));
-				break;
-			default:
-				elog(ERROR, "unrecognized CmdType: %d",
-					 (int) parsetree->commandType);
-				break;
+			}
 		}
 	}
 
+	/* Check if the expansion of non-system views are restricted */
+	if (unlikely((restrict_nonsystem_relation_kind & RESTRICT_RELKIND_VIEW) != 0 &&
+				 RelationGetRelid(view) >= FirstNormalObjectId))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("access to non-system view \"%s\" is restricted",
+						RelationGetRelationName(view))));
+
 	/*
-	 * For INSERT/UPDATE the modified columns must all be updatable. Note that
-	 * we get the modified columns from the query's targetlist, not from the
-	 * result RTE's insertedCols and/or updatedCols set, since
-	 * rewriteTargetListIU may have added additional targetlist entries for
-	 * view defaults, and these must also be updatable.
+	 * The view must be updatable, else fail.
+	 *
+	 * If we are doing INSERT/UPDATE (or MERGE containing INSERT/UPDATE), we
+	 * also check that there is at least one updatable column.
 	 */
-	if (parsetree->commandType != CMD_DELETE)
+	auto_update_detail =
+		view_query_is_auto_updatable(viewquery, insert_or_update);
+
+	if (auto_update_detail)
+		error_view_not_updatable(view,
+								 parsetree->commandType,
+								 parsetree->mergeActionList,
+								 auto_update_detail);
+
+	/*
+	 * For INSERT/UPDATE (or MERGE containing INSERT/UPDATE) the modified
+	 * columns must all be updatable.
+	 */
+	if (insert_or_update)
 	{
-		Bitmapset  *modified_cols = NULL;
+		Bitmapset  *modified_cols;
 		char	   *non_updatable_col;
+
+		/*
+		 * Compute the set of modified columns as those listed in the result
+		 * RTE's insertedCols and/or updatedCols sets plus those that are
+		 * targets of the query's targetlist(s).  We must consider the query's
+		 * targetlist because rewriteTargetListIU may have added additional
+		 * targetlist entries for view defaults, and these must also be
+		 * updatable.  But rewriteTargetListIU can also remove entries if they
+		 * are DEFAULT markers and the column's default is NULL, so
+		 * considering only the targetlist would also be wrong.
+		 */
+		modified_cols = bms_union(view_perminfo->insertedCols,
+								  view_perminfo->updatedCols);
 
 		foreach(lc, parsetree->targetList)
 		{
@@ -3157,6 +3284,20 @@ rewriteTargetView(Query *parsetree, Relation view)
 				if (!tle->resjunk)
 					modified_cols = bms_add_member(modified_cols,
 												   tle->resno - FirstLowInvalidHeapAttributeNumber);
+			}
+		}
+
+		foreach_node(MergeAction, action, parsetree->mergeActionList)
+		{
+			if (action->commandType == CMD_INSERT ||
+				action->commandType == CMD_UPDATE)
+			{
+				foreach_node(TargetEntry, tle, action->targetList)
+				{
+					if (!tle->resjunk)
+						modified_cols = bms_add_member(modified_cols,
+													   tle->resno - FirstLowInvalidHeapAttributeNumber);
+				}
 			}
 		}
 
@@ -3188,6 +3329,14 @@ rewriteTargetView(Query *parsetree, Relation view)
 									RelationGetRelationName(view)),
 							 errdetail_internal("%s", _(auto_update_detail))));
 					break;
+				case CMD_MERGE:
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot merge into column \"%s\" of view \"%s\"",
+									non_updatable_col,
+									RelationGetRelationName(view)),
+							 errdetail_internal("%s", _(auto_update_detail))));
+					break;
 				default:
 					elog(ERROR, "unrecognized CmdType: %d",
 						 (int) parsetree->commandType);
@@ -3196,8 +3345,27 @@ rewriteTargetView(Query *parsetree, Relation view)
 		}
 	}
 
-	/* Locate RTE describing the view in the outer query */
-	view_rte = rt_fetch(parsetree->resultRelation, parsetree->rtable);
+	/*
+	 * For MERGE, there must not be any INSTEAD OF triggers on an otherwise
+	 * updatable view.  The caller already checked that there isn't a full set
+	 * of INSTEAD OF triggers, so this is to guard against having a partial
+	 * set (mixing auto-update and trigger-update actions in a single command
+	 * isn't supported).
+	 */
+	if (parsetree->commandType == CMD_MERGE)
+	{
+		foreach_node(MergeAction, action, parsetree->mergeActionList)
+		{
+			if (action->commandType != CMD_NOTHING &&
+				view_has_instead_trigger(view, action->commandType, NIL))
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot merge into view \"%s\"",
+							   RelationGetRelationName(view)),
+						errdetail("MERGE is not supported for views with INSTEAD OF triggers for some actions but not all."),
+						errhint("To enable merging into the view, either provide a full set of INSTEAD OF triggers or drop the existing INSTEAD OF triggers."));
+		}
+	}
 
 	/*
 	 * If we get here, view_query_is_auto_updatable() has verified that the
@@ -3209,6 +3377,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 	base_rt_index = rtr->rtindex;
 	base_rte = rt_fetch(base_rt_index, viewquery->rtable);
 	Assert(base_rte->rtekind == RTE_RELATION);
+	base_perminfo = getRTEPermissionInfo(viewquery->rteperminfos, base_rte);
 
 	/*
 	 * Up to now, the base relation hasn't been touched at all in our query.
@@ -3258,8 +3427,8 @@ rewriteTargetView(Query *parsetree, Relation view)
 	new_rt_index = list_length(parsetree->rtable);
 
 	/*
-	 * INSERTs never inherit.  For UPDATE/DELETE, we use the view query's
-	 * inheritance flag for the base relation.
+	 * INSERTs never inherit.  For UPDATE/DELETE/MERGE, we use the view
+	 * query's inheritance flag for the base relation.
 	 */
 	if (parsetree->commandType == CMD_INSERT)
 		new_rte->inh = false;
@@ -3280,57 +3449,66 @@ rewriteTargetView(Query *parsetree, Relation view)
 				   0);
 
 	/*
-	 * If the view has "security_invoker" set, mark the new target RTE for the
-	 * permissions checks that we want to enforce against the query caller.
-	 * Otherwise we want to enforce them against the view owner.
+	 * If the view has "security_invoker" set, mark the new target relation
+	 * for the permissions checks that we want to enforce against the query
+	 * caller. Otherwise we want to enforce them against the view owner.
 	 *
 	 * At the relation level, require the same INSERT/UPDATE/DELETE
 	 * permissions that the query caller needs against the view.  We drop the
-	 * ACL_SELECT bit that is presumably in new_rte->requiredPerms initially.
+	 * ACL_SELECT bit that is presumably in new_perminfo->requiredPerms
+	 * initially.
 	 *
-	 * Note: the original view RTE remains in the query's rangetable list.
-	 * Although it will be unused in the query plan, we need it there so that
-	 * the executor still performs appropriate permissions checks for the
-	 * query caller's use of the view.
+	 * Note: the original view's RTEPermissionInfo remains in the query's
+	 * rteperminfos so that the executor still performs appropriate
+	 * permissions checks for the query caller's use of the view.
+	 *
+	 * Disregard the perminfo in viewquery->rteperminfos that the base_rte
+	 * would currently be pointing at, because we'd like it to point now to a
+	 * new one that will be filled below.  Must set perminfoindex to 0 to not
+	 * trip over the Assert in addRTEPermissionInfo().
 	 */
+	new_rte->perminfoindex = 0;
+	new_perminfo = addRTEPermissionInfo(&parsetree->rteperminfos, new_rte);
 	if (RelationHasSecurityInvoker(view))
-		new_rte->checkAsUser = InvalidOid;
+		new_perminfo->checkAsUser = InvalidOid;
 	else
-		new_rte->checkAsUser = view->rd_rel->relowner;
-
-	new_rte->requiredPerms = view_rte->requiredPerms;
+		new_perminfo->checkAsUser = view->rd_rel->relowner;
+	new_perminfo->requiredPerms = view_perminfo->requiredPerms;
 
 	/*
 	 * Now for the per-column permissions bits.
 	 *
-	 * Initially, new_rte contains selectedCols permission check bits for all
-	 * base-rel columns referenced by the view, but since the view is a SELECT
-	 * query its insertedCols/updatedCols is empty.  We set insertedCols and
-	 * updatedCols to include all the columns the outer query is trying to
-	 * modify, adjusting the column numbers as needed.  But we leave
-	 * selectedCols as-is, so the view owner must have read permission for all
-	 * columns used in the view definition, even if some of them are not read
-	 * by the outer query.  We could try to limit selectedCols to only columns
-	 * used in the transformed query, but that does not correspond to what
-	 * happens in ordinary SELECT usage of a view: all referenced columns must
-	 * have read permission, even if optimization finds that some of them can
-	 * be discarded during query transformation.  The flattening we're doing
-	 * here is an optional optimization, too.  (If you are unpersuaded and
-	 * want to change this, note that applying adjust_view_column_set to
-	 * view_rte->selectedCols is clearly *not* the right answer, since that
-	 * neglects base-rel columns used in the view's WHERE quals.)
+	 * Initially, new_perminfo (base_perminfo) contains selectedCols
+	 * permission check bits for all base-rel columns referenced by the view,
+	 * but since the view is a SELECT query its insertedCols/updatedCols is
+	 * empty.  We set insertedCols and updatedCols to include all the columns
+	 * the outer query is trying to modify, adjusting the column numbers as
+	 * needed.  But we leave selectedCols as-is, so the view owner must have
+	 * read permission for all columns used in the view definition, even if
+	 * some of them are not read by the outer query.  We could try to limit
+	 * selectedCols to only columns used in the transformed query, but that
+	 * does not correspond to what happens in ordinary SELECT usage of a view:
+	 * all referenced columns must have read permission, even if optimization
+	 * finds that some of them can be discarded during query transformation.
+	 * The flattening we're doing here is an optional optimization, too.  (If
+	 * you are unpersuaded and want to change this, note that applying
+	 * adjust_view_column_set to view_perminfo->selectedCols is clearly *not*
+	 * the right answer, since that neglects base-rel columns used in the
+	 * view's WHERE quals.)
 	 *
 	 * This step needs the modified view targetlist, so we have to do things
 	 * in this order.
 	 */
-	Assert(bms_is_empty(new_rte->insertedCols) &&
-		   bms_is_empty(new_rte->updatedCols));
+	Assert(bms_is_empty(new_perminfo->insertedCols) &&
+		   bms_is_empty(new_perminfo->updatedCols));
 
-	new_rte->insertedCols = adjust_view_column_set(view_rte->insertedCols,
-												   view_targetlist);
+	new_perminfo->selectedCols = base_perminfo->selectedCols;
 
-	new_rte->updatedCols = adjust_view_column_set(view_rte->updatedCols,
-												  view_targetlist);
+	new_perminfo->insertedCols =
+		adjust_view_column_set(view_perminfo->insertedCols, view_targetlist);
+
+	new_perminfo->updatedCols =
+		adjust_view_column_set(view_perminfo->updatedCols, view_targetlist);
 
 	/*
 	 * Move any security barrier quals from the view RTE onto the new target
@@ -3352,7 +3530,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 								  view_targetlist,
 								  REPLACEVARS_REPORT_ERROR,
 								  0,
-								  &parsetree->hasSubLinks);
+								  NULL);
 
 	/*
 	 * Update all other RTI references in the query that point to the view
@@ -3369,11 +3547,12 @@ rewriteTargetView(Query *parsetree, Relation view)
 	/*
 	 * For INSERT/UPDATE we must also update resnos in the targetlist to refer
 	 * to columns of the base relation, since those indicate the target
-	 * columns to be affected.
+	 * columns to be affected.  Similarly, for MERGE we must update the resnos
+	 * in the merge action targetlists of any INSERT/UPDATE actions.
 	 *
-	 * Note that this destroys the resno ordering of the targetlist, but that
-	 * will be fixed when we recurse through rewriteQuery, which will invoke
-	 * rewriteTargetListIU again on the updated targetlist.
+	 * Note that this destroys the resno ordering of the targetlists, but that
+	 * will be fixed when we recurse through RewriteQuery, which will invoke
+	 * rewriteTargetListIU again on the updated targetlists.
 	 */
 	if (parsetree->commandType != CMD_DELETE)
 	{
@@ -3391,6 +3570,28 @@ rewriteTargetView(Query *parsetree, Relation view)
 			else
 				elog(ERROR, "attribute number %d not found in view targetlist",
 					 tle->resno);
+		}
+
+		foreach_node(MergeAction, action, parsetree->mergeActionList)
+		{
+			if (action->commandType == CMD_INSERT ||
+				action->commandType == CMD_UPDATE)
+			{
+				foreach_node(TargetEntry, tle, action->targetList)
+				{
+					TargetEntry *view_tle;
+
+					if (tle->resjunk)
+						continue;
+
+					view_tle = get_tle_by_resno(view_targetlist, tle->resno);
+					if (view_tle != NULL && !view_tle->resjunk && IsA(view_tle->expr, Var))
+						tle->resno = ((Var *) view_tle->expr)->varattno;
+					else
+						elog(ERROR, "attribute number %d not found in view targetlist",
+							 tle->resno);
+				}
+			}
 		}
 	}
 
@@ -3434,7 +3635,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 		 * from the view, hence we need a new column alias list).  This should
 		 * match transformOnConflictClause.  In particular, note that the
 		 * relkind is set to composite to signal that we're not dealing with
-		 * an actual relation, and no permissions checks are wanted.
+		 * an actual relation.
 		 */
 		old_exclRelIndex = parsetree->onConflict->exclRelIndex;
 
@@ -3445,8 +3646,8 @@ rewriteTargetView(Query *parsetree, Relation view)
 													   false, false);
 		new_exclRte = new_exclNSItem->p_rte;
 		new_exclRte->relkind = RELKIND_COMPOSITE_TYPE;
-		new_exclRte->requiredPerms = 0;
-		/* other permissions fields in new_exclRte are already empty */
+		/* Ignore the RTEPermissionInfo that would've been added. */
+		new_exclRte->perminfoindex = 0;
 
 		parsetree->rtable = lappend(parsetree->rtable, new_exclRte);
 		new_exclRelIndex = parsetree->onConflict->exclRelIndex =
@@ -3484,10 +3685,10 @@ rewriteTargetView(Query *parsetree, Relation view)
 	}
 
 	/*
-	 * For UPDATE/DELETE, pull up any WHERE quals from the view.  We know that
-	 * any Vars in the quals must reference the one base relation, so we need
-	 * only adjust their varnos to reference the new target (just the same as
-	 * we did with the view targetlist).
+	 * For UPDATE/DELETE/MERGE, pull up any WHERE quals from the view.  We
+	 * know that any Vars in the quals must reference the one base relation,
+	 * so we need only adjust their varnos to reference the new target (just
+	 * the same as we did with the view targetlist).
 	 *
 	 * If it's a security-barrier view, its WHERE quals must be applied before
 	 * quals from the outer query, so we attach them to the RTE as security
@@ -3539,11 +3740,12 @@ rewriteTargetView(Query *parsetree, Relation view)
 	}
 
 	/*
-	 * For INSERT/UPDATE, if the view has the WITH CHECK OPTION, or any parent
-	 * view specified WITH CASCADED CHECK OPTION, add the quals from the view
-	 * to the query's withCheckOptions list.
+	 * For INSERT/UPDATE (or MERGE containing INSERT/UPDATE), if the view has
+	 * the WITH CHECK OPTION, or any parent view specified WITH CASCADED CHECK
+	 * OPTION, add the quals from the view to the query's withCheckOptions
+	 * list.
 	 */
-	if (parsetree->commandType != CMD_DELETE)
+	if (insert_or_update)
 	{
 		bool		has_wco = RelationHasCheckOption(view);
 		bool		cascaded = RelationHasCascadedCheckOption(view);
@@ -3559,7 +3761,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 		if (parsetree->withCheckOptions != NIL)
 		{
 			WithCheckOption *parent_wco =
-			(WithCheckOption *) linitial(parsetree->withCheckOptions);
+				(WithCheckOption *) linitial(parsetree->withCheckOptions);
 
 			if (parent_wco->cascaded)
 			{
@@ -3597,14 +3799,13 @@ rewriteTargetView(Query *parsetree, Relation view)
 				ChangeVarNodes(wco->qual, base_rt_index, new_rt_index, 0);
 
 				/*
-				 * Make sure that the query is marked correctly if the added
-				 * qual has sublinks.  We can skip this check if the query is
-				 * already marked, or if the command is an UPDATE, in which
-				 * case the same qual will have already been added, and this
-				 * check will already have been done.
+				 * For INSERT, make sure that the query is marked correctly if
+				 * the added qual has sublinks.  This can be skipped for
+				 * UPDATE/MERGE, since the same qual will have already been
+				 * added above, and the check will already have been done.
 				 */
 				if (!parsetree->hasSubLinks &&
-					parsetree->commandType != CMD_UPDATE)
+					parsetree->commandType == CMD_INSERT)
 					parsetree->hasSubLinks = checkExprHasSubLink(wco->qual);
 			}
 		}
@@ -3622,9 +3823,13 @@ rewriteTargetView(Query *parsetree, Relation view)
  *
  * rewrite_events is a list of open query-rewrite actions, so we can detect
  * infinite recursion.
+ *
+ * orig_rt_length is the length of the originating query's rtable, for product
+ * queries created by fireRules(), and 0 otherwise.  This is used to skip any
+ * already-processed VALUES RTEs from the original query.
  */
 static List *
-RewriteQuery(Query *parsetree, List *rewrite_events)
+RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length)
 {
 	CmdType		event = parsetree->commandType;
 	bool		instead = false;
@@ -3635,9 +3840,9 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 	ListCell   *lc1;
 
 	/*
-	 * First, recursively process any insert/update/delete statements in WITH
-	 * clauses.  (We have to do this first because the WITH clauses may get
-	 * copied into rule actions below.)
+	 * First, recursively process any insert/update/delete/merge statements in
+	 * WITH clauses.  (We have to do this first because the WITH clauses may
+	 * get copied into rule actions below.)
 	 */
 	foreach(lc1, parsetree->cteList)
 	{
@@ -3648,7 +3853,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		if (ctequery->commandType == CMD_SELECT)
 			continue;
 
-		newstuff = RewriteQuery(ctequery, rewrite_events);
+		newstuff = RewriteQuery(ctequery, rewrite_events, 0);
 
 		/*
 		 * Currently we can only handle unconditional, single-statement DO
@@ -3662,7 +3867,8 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 			if (!(ctequery->commandType == CMD_SELECT ||
 				  ctequery->commandType == CMD_UPDATE ||
 				  ctequery->commandType == CMD_INSERT ||
-				  ctequery->commandType == CMD_DELETE))
+				  ctequery->commandType == CMD_DELETE ||
+				  ctequery->commandType == CMD_MERGE))
 			{
 				/*
 				 * Currently it could only be NOTIFY; this error message will
@@ -3722,6 +3928,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		RangeTblEntry *rt_entry;
 		Relation	rt_entry_relation;
 		List	   *locks;
+		int			product_orig_rt_length;
 		List	   *product_queries;
 		bool		hasUpdate = false;
 		int			values_rte_index = 0;
@@ -3743,23 +3950,30 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		 */
 		if (event == CMD_INSERT)
 		{
+			ListCell   *lc2;
 			RangeTblEntry *values_rte = NULL;
 
 			/*
-			 * If it's an INSERT ... VALUES (...), (...), ... there will be a
-			 * single RTE for the VALUES targetlists.
+			 * Test if it's a multi-row INSERT ... VALUES (...), (...), ... by
+			 * looking for a VALUES RTE in the fromlist.  For product queries,
+			 * we must ignore any already-processed VALUES RTEs from the
+			 * original query.  These appear at the start of the rangetable.
 			 */
-			if (list_length(parsetree->jointree->fromlist) == 1)
+			foreach(lc2, parsetree->jointree->fromlist)
 			{
-				RangeTblRef *rtr = (RangeTblRef *) linitial(parsetree->jointree->fromlist);
+				RangeTblRef *rtr = (RangeTblRef *) lfirst(lc2);
 
-				if (IsA(rtr, RangeTblRef))
+				if (IsA(rtr, RangeTblRef) && rtr->rtindex > orig_rt_length)
 				{
 					RangeTblEntry *rte = rt_fetch(rtr->rtindex,
 												  parsetree->rtable);
 
 					if (rte->rtekind == RTE_VALUES)
 					{
+						/* should not find more than one VALUES RTE */
+						if (values_rte != NULL)
+							elog(ERROR, "more than one VALUES RTE found");
+
 						values_rte = rte;
 						values_rte_index = rtr->rtindex;
 					}
@@ -3815,9 +4029,6 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 									parsetree->override,
 									rt_entry_relation,
 									NULL, 0, NULL);
-
-			/* Also populate extraUpdatedCols (for generated columns) */
-			fill_extraUpdatedCols(rt_entry, rt_entry_relation);
 		}
 		else if (event == CMD_MERGE)
 		{
@@ -3837,7 +4048,11 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 						break;
 					case CMD_UPDATE:
 					case CMD_INSERT:
-						/* XXX is it possible to have a VALUES clause? */
+
+						/*
+						 * MERGE actions do not permit multi-row INSERTs, so
+						 * there is no VALUES RTE to deal with here.
+						 */
 						action->targetList =
 							rewriteTargetListIU(action->targetList,
 												action->commandType,
@@ -3861,9 +4076,10 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		/*
 		 * Collect and apply the appropriate rules.
 		 */
-		locks = matchLocks(event, rt_entry_relation->rd_rules,
+		locks = matchLocks(event, rt_entry_relation,
 						   result_relation, parsetree, &hasUpdate);
 
+		product_orig_rt_length = list_length(parsetree->rtable);
 		product_queries = fireRules(parsetree,
 									result_relation,
 									event,
@@ -3887,12 +4103,39 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 			/*
 			 * Each product query has its own copy of the VALUES RTE at the
 			 * same index in the rangetable, so we must finalize each one.
+			 *
+			 * Note that if the product query is an INSERT ... SELECT, then
+			 * the VALUES RTE will be at the same index in the SELECT part of
+			 * the product query rather than the top-level product query
+			 * itself.
 			 */
 			foreach(n, product_queries)
 			{
 				Query	   *pt = (Query *) lfirst(n);
-				RangeTblEntry *values_rte = rt_fetch(values_rte_index,
-													 pt->rtable);
+				RangeTblEntry *values_rte;
+
+				if (pt->commandType == CMD_INSERT &&
+					pt->jointree && IsA(pt->jointree, FromExpr) &&
+					list_length(pt->jointree->fromlist) == 1)
+				{
+					Node	   *jtnode = (Node *) linitial(pt->jointree->fromlist);
+
+					if (IsA(jtnode, RangeTblRef))
+					{
+						int			rtindex = ((RangeTblRef *) jtnode)->rtindex;
+						RangeTblEntry *src_rte = rt_fetch(rtindex, pt->rtable);
+
+						if (src_rte->rtekind == RTE_SUBQUERY &&
+							src_rte->subquery &&
+							IsA(src_rte->subquery, Query) &&
+							src_rte->subquery->commandType == CMD_SELECT)
+							pt = src_rte->subquery;
+					}
+				}
+
+				values_rte = rt_fetch(values_rte_index, pt->rtable);
+				if (values_rte->rtekind != RTE_VALUES)
+					elog(ERROR, "failed to find VALUES RTE in product query");
 
 				rewriteValuesRTEToNulls(pt, values_rte);
 			}
@@ -3904,7 +4147,8 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		 * automatically updated.  If so, we perform the necessary query
 		 * transformation here and add the resulting query to the
 		 * product_queries list, so that it gets recursively rewritten if
-		 * necessary.
+		 * necessary.  For MERGE, the view must be automatically updatable if
+		 * any of the merge actions lack a corresponding INSTEAD OF trigger.
 		 *
 		 * If the view cannot be automatically updated, we throw an error here
 		 * which is OK since the query would fail at runtime anyway.  Throwing
@@ -3914,51 +4158,19 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		 */
 		if (!instead &&
 			rt_entry_relation->rd_rel->relkind == RELKIND_VIEW &&
-			!view_has_instead_trigger(rt_entry_relation, event))
+			!view_has_instead_trigger(rt_entry_relation, event,
+									  parsetree->mergeActionList))
 		{
 			/*
 			 * If there were any qualified INSTEAD rules, don't allow the view
 			 * to be automatically updated (an unqualified INSTEAD rule or
 			 * INSTEAD OF trigger is required).
-			 *
-			 * The messages here should match execMain.c's CheckValidResultRel
-			 * and in principle make those checks in executor unnecessary, but
-			 * we keep them just in case.
 			 */
 			if (qual_product != NULL)
-			{
-				switch (parsetree->commandType)
-				{
-					case CMD_INSERT:
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("cannot insert into view \"%s\"",
-										RelationGetRelationName(rt_entry_relation)),
-								 errdetail("Views with conditional DO INSTEAD rules are not automatically updatable."),
-								 errhint("To enable inserting into the view, provide an INSTEAD OF INSERT trigger or an unconditional ON INSERT DO INSTEAD rule.")));
-						break;
-					case CMD_UPDATE:
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("cannot update view \"%s\"",
-										RelationGetRelationName(rt_entry_relation)),
-								 errdetail("Views with conditional DO INSTEAD rules are not automatically updatable."),
-								 errhint("To enable updating the view, provide an INSTEAD OF UPDATE trigger or an unconditional ON UPDATE DO INSTEAD rule.")));
-						break;
-					case CMD_DELETE:
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("cannot delete from view \"%s\"",
-										RelationGetRelationName(rt_entry_relation)),
-								 errdetail("Views with conditional DO INSTEAD rules are not automatically updatable."),
-								 errhint("To enable deleting from the view, provide an INSTEAD OF DELETE trigger or an unconditional ON DELETE DO INSTEAD rule.")));
-						break;
-					default:
-						elog(ERROR, "unrecognized CmdType: %d",
-							 (int) parsetree->commandType);
-						break;
-				}
-			}
+				error_view_not_updatable(rt_entry_relation,
+										 parsetree->commandType,
+										 parsetree->mergeActionList,
+										 gettext_noop("Views with conditional DO INSTEAD rules are not automatically updatable."));
 
 			/*
 			 * Attempt to rewrite the query to automatically update the view.
@@ -4020,7 +4232,19 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 				Query	   *pt = (Query *) lfirst(n);
 				List	   *newstuff;
 
-				newstuff = RewriteQuery(pt, rewrite_events);
+				/*
+				 * For an updatable view, pt might be the rewritten version of
+				 * the original query, in which case we pass on orig_rt_length
+				 * to finish processing any VALUES RTE it contained.
+				 *
+				 * Otherwise, we have a product query created by fireRules().
+				 * Any VALUES RTEs from the original query have been fully
+				 * processed, and must be skipped when we recurse.
+				 */
+				newstuff = RewriteQuery(pt, rewrite_events,
+										pt == parsetree ?
+										orig_rt_length :
+										product_orig_rt_length);
 				rewritten = list_concat(rewritten, newstuff);
 			}
 
@@ -4172,7 +4396,7 @@ QueryRewrite(Query *parsetree)
 	 *
 	 * Apply all non-SELECT rules possibly getting 0 or many queries
 	 */
-	querylist = RewriteQuery(parsetree, NIL);
+	querylist = RewriteQuery(parsetree, NIL, 0);
 
 	/*
 	 * Step 2

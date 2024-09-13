@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 backend_sources += files(
   'analyze.c',
   'parse_agg.c',
@@ -8,6 +10,7 @@ backend_sources += files(
   'parse_enr.c',
   'parse_expr.c',
   'parse_func.c',
+  'parse_jsontable.c',
   'parse_merge.c',
   'parse_node.c',
   'parse_oper.c',

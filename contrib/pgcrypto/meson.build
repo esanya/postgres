@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 if not ssl.found()
   subdir_done()
 endif
@@ -46,6 +48,7 @@ pgcrypto_regress = [
   'pgp-armor',
   'pgp-decrypt',
   'pgp-encrypt',
+  'pgp-encrypt-md5',
   'pgp-pubkey-decrypt',
   'pgp-pubkey-encrypt',
   'pgp-info',

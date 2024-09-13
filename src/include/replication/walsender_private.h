@@ -3,7 +3,7 @@
  * walsender_private.h
  *	  Private definitions from replication/walsender.c.
  *
- * Portions Copyright (c) 2010-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2024, PostgreSQL Global Development Group
  *
  * src/include/replication/walsender_private.h
  *
@@ -13,8 +13,11 @@
 #define _WALSENDER_PRIVATE_H
 
 #include "access/xlog.h"
+#include "lib/ilist.h"
 #include "nodes/nodes.h"
+#include "nodes/replnodes.h"
 #include "replication/syncrep.h"
+#include "storage/condition_variable.h"
 #include "storage/latch.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
@@ -25,7 +28,7 @@ typedef enum WalSndState
 	WALSNDSTATE_BACKUP,
 	WALSNDSTATE_CATCHUP,
 	WALSNDSTATE_STREAMING,
-	WALSNDSTATE_STOPPING
+	WALSNDSTATE_STOPPING,
 } WalSndState;
 
 /*
@@ -78,6 +81,8 @@ typedef struct WalSnd
 	 * Timestamp of the last message received from standby.
 	 */
 	TimestampTz replyTime;
+
+	ReplicationKind kind;
 } WalSnd;
 
 extern PGDLLIMPORT WalSnd *MyWalSnd;
@@ -89,7 +94,7 @@ typedef struct
 	 * Synchronous replication queue with one queue per request type.
 	 * Protected by SyncRepLock.
 	 */
-	SHM_QUEUE	SyncRepQueue[NUM_SYNC_REP_WAIT_MODE];
+	dlist_head	SyncRepQueue[NUM_SYNC_REP_WAIT_MODE];
 
 	/*
 	 * Current location of the head of the queue. All waiters should have a
@@ -103,6 +108,17 @@ typedef struct
 	 * Protected by SyncRepLock.
 	 */
 	bool		sync_standbys_defined;
+
+	/* used as a registry of physical / logical walsenders to wake */
+	ConditionVariable wal_flush_cv;
+	ConditionVariable wal_replay_cv;
+
+	/*
+	 * Used by physical walsenders holding slots specified in
+	 * synchronized_standby_slots to wake up logical walsenders holding
+	 * logical failover slots when a walreceiver confirms the receipt of LSN.
+	 */
+	ConditionVariable wal_confirm_rcv_cv;
 
 	WalSnd		walsnds[FLEXIBLE_ARRAY_MEMBER];
 } WalSndCtlData;

@@ -1,9 +1,14 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 tests += {
   'name': 'recovery',
   'sd': meson.current_source_dir(),
   'bd': meson.current_build_dir(),
   'tap': {
     'test_kwargs': {'priority': 40}, # recovery tests are slow, start early
+    'env': {
+       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
+    },
     'tests': [
       't/001_stream_rep.pl',
       't/002_archiving.pl',
@@ -15,7 +20,6 @@ tests += {
       't/008_fsm_truncation.pl',
       't/009_twophase.pl',
       't/010_logical_decoding_timelines.pl',
-      't/011_crash_recovery.pl',
       't/012_subtransactions.pl',
       't/013_crash_restart.pl',
       't/014_unlogged_reinit.pl',
@@ -38,6 +42,16 @@ tests += {
       't/031_recovery_conflict.pl',
       't/032_relfilenode_reuse.pl',
       't/033_replay_tsp_drops.pl',
+      't/034_create_database.pl',
+      't/035_standby_logical_decoding.pl',
+      't/036_truncated_dropped.pl',
+      't/037_invalid_database.pl',
+      't/038_save_logical_slots_shutdown.pl',
+      't/039_end_of_wal.pl',
+      't/040_standby_failover_slots_sync.pl',
+      't/041_checkpoint_at_promote.pl',
+      't/042_low_level_backup.pl',
+      't/043_wal_replay_wait.pl',
     ],
   },
 }

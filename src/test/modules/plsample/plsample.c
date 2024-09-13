@@ -3,7 +3,7 @@
  * plsample.c
  *	  Handler for the PL/Sample procedural language
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -220,8 +220,7 @@ plsample_trigger_handler(PG_FUNCTION_ARGS)
 		elog(ERROR, "not called by trigger manager");
 
 	/* Connect to the SPI manager */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "could not connect to SPI manager");
+	SPI_connect();
 
 	rc = SPI_register_trigger_data(trigdata);
 	Assert(rc >= 0);

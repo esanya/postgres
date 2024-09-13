@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 pg_visibility_sources = files(
   'pg_visibility.c',
 )
@@ -29,6 +31,12 @@ tests += {
   'regress': {
     'sql': [
       'pg_visibility',
+    ],
+  },
+  'tap': {
+    'tests': [
+      't/001_concurrent_transaction.pl',
+      't/002_corrupt_vm.pl',
     ],
   },
 }

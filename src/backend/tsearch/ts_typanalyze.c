@@ -3,7 +3,7 @@
  * ts_typanalyze.c
  *	  functions for gathering statistics from tsvector columns
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -19,6 +19,7 @@
 #include "common/hashfn.h"
 #include "tsearch/ts_type.h"
 #include "utils/builtins.h"
+#include "varatt.h"
 
 
 /* A hash key for lexemes */
@@ -57,16 +58,14 @@ Datum
 ts_typanalyze(PG_FUNCTION_ARGS)
 {
 	VacAttrStats *stats = (VacAttrStats *) PG_GETARG_POINTER(0);
-	Form_pg_attribute attr = stats->attr;
 
 	/* If the attstattarget column is negative, use the default value */
-	/* NB: it is okay to scribble on stats->attr since it's a copy */
-	if (attr->attstattarget < 0)
-		attr->attstattarget = default_statistics_target;
+	if (stats->attstattarget < 0)
+		stats->attstattarget = default_statistics_target;
 
 	stats->compute_stats = compute_tsvector_stats;
 	/* see comment about the choice of minrows in commands/analyze.c */
-	stats->minrows = 300 * attr->attstattarget;
+	stats->minrows = 300 * stats->attstattarget;
 
 	PG_RETURN_BOOL(true);
 }
@@ -168,7 +167,7 @@ compute_tsvector_stats(VacAttrStats *stats,
 	 * the number of individual lexeme values tracked in pg_statistic ought to
 	 * be more than the number of values for a simple scalar column.
 	 */
-	num_mcelem = stats->attr->attstattarget * 10;
+	num_mcelem = stats->attstattarget * 10;
 
 	/*
 	 * We set bucket width equal to (num_mcelem + 10) / 0.007 as per the
@@ -253,7 +252,7 @@ compute_tsvector_stats(VacAttrStats *stats,
 
 			/* Lookup current lexeme in hashtable, adding it if new */
 			item = (TrackItem *) hash_search(lexemes_tab,
-											 (const void *) &hash_key,
+											 &hash_key,
 											 HASH_ENTER, &found);
 
 			if (found)
@@ -463,7 +462,7 @@ prune_lexemes_hashtable(HTAB *lexemes_tab, int b_current)
 		{
 			char	   *lexeme = item->key.lexeme;
 
-			if (hash_search(lexemes_tab, (const void *) &item->key,
+			if (hash_search(lexemes_tab, &item->key,
 							HASH_REMOVE, NULL) == NULL)
 				elog(ERROR, "hash table corrupted");
 			pfree(lexeme);

@@ -164,10 +164,9 @@ SELECT c, sum(a) FROM pagg_tab WHERE c = 'x' GROUP BY c;
            QUERY PLAN           
 --------------------------------
  GroupAggregate
-   Group Key: c
    ->  Result
          One-Time Filter: false
-(4 rows)
+(3 rows)
 
 SELECT c, sum(a) FROM pagg_tab WHERE c = 'x' GROUP BY c;
  c | sum 
@@ -805,10 +804,10 @@ SELECT a.x, b.y, count(*) FROM (SELECT * FROM pagg_tab1 WHERE x < 20) a FULL JOI
 -- Empty join relation because of empty outer side, no partitionwise agg plan
 EXPLAIN (COSTS OFF)
 SELECT a.x, a.y, count(*) FROM (SELECT * FROM pagg_tab1 WHERE x = 1 AND x = 2) a LEFT JOIN pagg_tab2 b ON a.x = b.y GROUP BY a.x, a.y ORDER BY 1, 2;
-              QUERY PLAN               
----------------------------------------
+              QUERY PLAN              
+--------------------------------------
  GroupAggregate
-   Group Key: pagg_tab1.x, pagg_tab1.y
+   Group Key: pagg_tab1.y
    ->  Sort
          Sort Key: pagg_tab1.y
          ->  Result
@@ -902,15 +901,15 @@ SELECT a, c, sum(b), avg(c), count(*) FROM pagg_tab_m GROUP BY (a+b)/2, 2, 1 HAV
    Sort Key: pagg_tab_m.a, pagg_tab_m.c, (sum(pagg_tab_m.b))
    ->  Append
          ->  HashAggregate
-               Group Key: ((pagg_tab_m.a + pagg_tab_m.b) / 2), pagg_tab_m.c, pagg_tab_m.a
+               Group Key: pagg_tab_m.a, pagg_tab_m.c, ((pagg_tab_m.a + pagg_tab_m.b) / 2)
                Filter: ((sum(pagg_tab_m.b) = 50) AND (avg(pagg_tab_m.c) > '25'::numeric))
                ->  Seq Scan on pagg_tab_m_p1 pagg_tab_m
          ->  HashAggregate
-               Group Key: ((pagg_tab_m_1.a + pagg_tab_m_1.b) / 2), pagg_tab_m_1.c, pagg_tab_m_1.a
+               Group Key: pagg_tab_m_1.a, pagg_tab_m_1.c, ((pagg_tab_m_1.a + pagg_tab_m_1.b) / 2)
                Filter: ((sum(pagg_tab_m_1.b) = 50) AND (avg(pagg_tab_m_1.c) > '25'::numeric))
                ->  Seq Scan on pagg_tab_m_p2 pagg_tab_m_1
          ->  HashAggregate
-               Group Key: ((pagg_tab_m_2.a + pagg_tab_m_2.b) / 2), pagg_tab_m_2.c, pagg_tab_m_2.a
+               Group Key: pagg_tab_m_2.a, pagg_tab_m_2.c, ((pagg_tab_m_2.a + pagg_tab_m_2.b) / 2)
                Filter: ((sum(pagg_tab_m_2.b) = 50) AND (avg(pagg_tab_m_2.c) > '25'::numeric))
                ->  Seq Scan on pagg_tab_m_p3 pagg_tab_m_2
 (15 rows)

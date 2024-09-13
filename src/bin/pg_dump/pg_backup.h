@@ -23,6 +23,8 @@
 #ifndef PG_BACKUP_H
 #define PG_BACKUP_H
 
+#include "common/compression.h"
+#include "common/file_utils.h"
 #include "fe_utils/simple_list.h"
 #include "libpq-fe.h"
 
@@ -31,7 +33,7 @@ typedef enum trivalue
 {
 	TRI_DEFAULT,
 	TRI_NO,
-	TRI_YES
+	TRI_YES,
 } trivalue;
 
 typedef enum _archiveFormat
@@ -40,22 +42,22 @@ typedef enum _archiveFormat
 	archCustom = 1,
 	archTar = 3,
 	archNull = 4,
-	archDirectory = 5
+	archDirectory = 5,
 } ArchiveFormat;
 
 typedef enum _archiveMode
 {
 	archModeAppend,
 	archModeWrite,
-	archModeRead
+	archModeRead,
 } ArchiveMode;
 
 typedef enum _teSection
 {
-	SECTION_NONE = 1,			/* COMMENTs, ACLs, etc; can be anywhere */
+	SECTION_NONE = 1,			/* comments, ACLs, etc; can be anywhere */
 	SECTION_PRE_DATA,			/* stuff to be processed before data */
-	SECTION_DATA,				/* TABLE DATA, BLOBS, BLOB COMMENTS */
-	SECTION_POST_DATA			/* stuff to be processed after data */
+	SECTION_DATA,				/* table data, large objects, LO comments */
+	SECTION_POST_DATA,			/* stuff to be processed after data */
 } teSection;
 
 /* We need one enum entry per prepared query in pg_dump */
@@ -143,10 +145,13 @@ typedef struct _restoreOptions
 
 	int			noDataForFailedTables;
 	int			exit_on_error;
-	int			compression;
+	pg_compress_specification compression_spec; /* Specification for
+												 * compression */
 	int			suppressDumpWarnings;	/* Suppress output of WARNING entries
 										 * to stderr */
-	bool		single_txn;
+
+	bool		single_txn;		/* restore all TOCs in one transaction */
+	int			txn_size;		/* restore this many TOCs per txn, if > 0 */
 
 	bool	   *idWanted;		/* array showing which dump IDs to emit */
 	int			enable_row_security;
@@ -191,8 +196,8 @@ typedef struct _dumpOptions
 
 	int			outputClean;
 	int			outputCreateDB;
-	bool		outputBlobs;
-	bool		dontOutputBlobs;
+	bool		outputLOs;
+	bool		dontOutputLOs;
 	int			outputNoOwner;
 	char	   *outputSuperuser;
 
@@ -287,8 +292,8 @@ extern PGconn *GetConnection(Archive *AHX);
 /* Called to write *data* to the archive */
 extern void WriteData(Archive *AHX, const void *data, size_t dLen);
 
-extern int	StartBlob(Archive *AHX, Oid oid);
-extern int	EndBlob(Archive *AHX, Oid oid);
+extern int	StartLO(Archive *AHX, Oid oid);
+extern int	EndLO(Archive *AHX, Oid oid);
 
 extern void CloseArchive(Archive *AHX);
 
@@ -303,8 +308,10 @@ extern Archive *OpenArchive(const char *FileSpec, const ArchiveFormat fmt);
 
 /* Create a new archive */
 extern Archive *CreateArchive(const char *FileSpec, const ArchiveFormat fmt,
-							  const int compression, bool dosync, ArchiveMode mode,
-							  SetupWorkerPtrType setupDumpWorker);
+							  const pg_compress_specification compression_spec,
+							  bool dosync, ArchiveMode mode,
+							  SetupWorkerPtrType setupDumpWorker,
+							  DataDirSyncMethod sync_method);
 
 /* The --list option */
 extern void PrintTOCSummary(Archive *AHX);

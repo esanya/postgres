@@ -25,7 +25,7 @@
  * This implementation only uses the comparison function of the range element
  * datatype, therefore it works for any range type.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -39,8 +39,8 @@
 #include "access/spgist.h"
 #include "access/stratnum.h"
 #include "catalog/pg_type.h"
-#include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/fmgrprotos.h"
 #include "utils/rangetypes.h"
 
 static int16 getQuadrant(TypeCacheEntry *typcache, const RangeType *centroid,
@@ -265,7 +265,7 @@ spg_range_quad_picksplit(PG_FUNCTION_ARGS)
 
 	/* Construct "centroid" range from medians of lower and upper bounds */
 	centroid = range_serialize(typcache, &lowerBounds[nonEmptyCount / 2],
-							   &upperBounds[nonEmptyCount / 2], false);
+							   &upperBounds[nonEmptyCount / 2], false, NULL);
 	out->hasPrefix = true;
 	out->prefixDatum = RangeTypePGetDatum(centroid);
 

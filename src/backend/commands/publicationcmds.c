@@ -3,7 +3,7 @@
  * publicationcmds.c
  *		publication manipulation
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,7 +14,6 @@
 
 #include "postgres.h"
 
-#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -23,19 +22,17 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/objectaddress.h"
-#include "catalog/partition.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
-#include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/publicationcmds.h"
-#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_clause.h"
@@ -43,10 +40,7 @@
 #include "parser/parse_relation.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
-#include "utils/array.h"
 #include "utils/builtins.h"
-#include "utils/catcache.h"
-#include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -748,7 +742,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	List	   *schemaidlist = NIL;
 
 	/* must have CREATE privilege on database */
-	aclresult = pg_database_aclcheck(MyDatabaseId, GetUserId(), ACL_CREATE);
+	aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(), ACL_CREATE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_DATABASE,
 					   get_database_name(MyDatabaseId));
@@ -864,8 +858,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	if (wal_level != WAL_LEVEL_LOGICAL)
 		ereport(WARNING,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("wal_level is insufficient to publish logical changes"),
-				 errhint("Set wal_level to \"logical\" before creating subscriptions.")));
+				 errmsg("\"wal_level\" is insufficient to publish logical changes"),
+				 errhint("Set \"wal_level\" to \"logical\" before creating subscriptions.")));
 
 	return myself;
 }
@@ -1182,21 +1176,13 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 				newrelid = RelationGetRelid(newpubrel->relation);
 
 				/*
-				 * If the new publication has column list, transform it to a
-				 * bitmap too.
+				 * Validate the column list.  If the column list or WHERE
+				 * clause changes, then the validation done here will be
+				 * duplicated inside PublicationAddTables().  The validation
+				 * is cheap enough that that seems harmless.
 				 */
-				if (newpubrel->columns)
-				{
-					ListCell   *lc;
-
-					foreach(lc, newpubrel->columns)
-					{
-						char	   *colname = strVal(lfirst(lc));
-						AttrNumber	attnum = get_attnum(newrelid, colname);
-
-						newcolumns = bms_add_member(newcolumns, attnum);
-					}
-				}
+				newcolumns = pub_collist_validate(newpubrel->relation,
+												  newpubrel->columns);
 
 				/*
 				 * Check if any of the new set of relations matches with the
@@ -1205,7 +1191,7 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 				 * expressions also match. Same for the column list. Drop the
 				 * rest.
 				 */
-				if (RelationGetRelid(newpubrel->relation) == oldrelid)
+				if (newrelid == oldrelid)
 				{
 					if (equal(oldrelwhereclause, newpubrel->whereClause) &&
 						bms_equal(oldcolumns, newcolumns))
@@ -1394,7 +1380,7 @@ AlterPublication(ParseState *pstate, AlterPublicationStmt *stmt)
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
 
 	/* must be owner */
-	if (!pg_publication_ownercheck(pubform->oid, GetUserId()))
+	if (!object_ownercheck(PublicationRelationId, pubform->oid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_PUBLICATION,
 					   stmt->pubname);
 
@@ -1764,7 +1750,7 @@ PublicationAddTables(Oid pubid, List *rels, bool if_not_exists,
 		ObjectAddress obj;
 
 		/* Must be owner of the table or superuser. */
-		if (!pg_class_ownercheck(RelationGetRelid(rel), GetUserId()))
+		if (!object_ownercheck(RelationRelationId, RelationGetRelid(rel), GetUserId()))
 			aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(rel->rd_rel->relkind),
 						   RelationGetRelationName(rel));
 
@@ -1905,15 +1891,15 @@ AlterPublicationOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 		AclResult	aclresult;
 
 		/* Must be owner */
-		if (!pg_publication_ownercheck(form->oid, GetUserId()))
+		if (!object_ownercheck(PublicationRelationId, form->oid, GetUserId()))
 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_PUBLICATION,
 						   NameStr(form->pubname));
 
 		/* Must be able to become new owner */
-		check_is_member_of_role(GetUserId(), newOwnerId);
+		check_can_set_role(GetUserId(), newOwnerId);
 
 		/* New owner must have CREATE privilege on database */
-		aclresult = pg_database_aclcheck(MyDatabaseId, newOwnerId, ACL_CREATE);
+		aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, newOwnerId, ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_DATABASE,
 						   get_database_name(MyDatabaseId));

@@ -2,7 +2,7 @@
  * test_ddl_deparse.c
  *		Support functions for the test_ddl_deparse module
  *
- * Copyright (c) 2014-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/test/modules/test_ddl_deparse/test_ddl_deparse.c
@@ -114,9 +114,6 @@ get_altertable_subcmdinfo(PG_FUNCTION_ARGS)
 			case AT_AddColumn:
 				strtype = "ADD COLUMN";
 				break;
-			case AT_AddColumnRecurse:
-				strtype = "ADD COLUMN (and recurse)";
-				break;
 			case AT_AddColumnToView:
 				strtype = "ADD COLUMN TO VIEW";
 				break;
@@ -131,6 +128,9 @@ get_altertable_subcmdinfo(PG_FUNCTION_ARGS)
 				break;
 			case AT_SetNotNull:
 				strtype = "SET NOT NULL";
+				break;
+			case AT_SetExpression:
+				strtype = "SET EXPRESSION";
 				break;
 			case AT_DropExpression:
 				strtype = "DROP EXPRESSION";
@@ -156,9 +156,6 @@ get_altertable_subcmdinfo(PG_FUNCTION_ARGS)
 			case AT_DropColumn:
 				strtype = "DROP COLUMN";
 				break;
-			case AT_DropColumnRecurse:
-				strtype = "DROP COLUMN (and recurse)";
-				break;
 			case AT_AddIndex:
 				strtype = "ADD INDEX";
 				break;
@@ -167,9 +164,6 @@ get_altertable_subcmdinfo(PG_FUNCTION_ARGS)
 				break;
 			case AT_AddConstraint:
 				strtype = "ADD CONSTRAINT";
-				break;
-			case AT_AddConstraintRecurse:
-				strtype = "ADD CONSTRAINT (and recurse)";
 				break;
 			case AT_ReAddConstraint:
 				strtype = "(re) ADD CONSTRAINT";
@@ -183,17 +177,11 @@ get_altertable_subcmdinfo(PG_FUNCTION_ARGS)
 			case AT_ValidateConstraint:
 				strtype = "VALIDATE CONSTRAINT";
 				break;
-			case AT_ValidateConstraintRecurse:
-				strtype = "VALIDATE CONSTRAINT (and recurse)";
-				break;
 			case AT_AddIndexConstraint:
 				strtype = "ADD CONSTRAINT (using index)";
 				break;
 			case AT_DropConstraint:
 				strtype = "DROP CONSTRAINT";
-				break;
-			case AT_DropConstraintRecurse:
-				strtype = "DROP CONSTRAINT (and recurse)";
 				break;
 			case AT_ReAddComment:
 				strtype = "(re) ADD COMMENT";
@@ -326,10 +314,14 @@ get_altertable_subcmdinfo(PG_FUNCTION_ARGS)
 				break;
 		}
 
-		values[0] = CStringGetTextDatum(strtype);
+		if (subcmd->recurse)
+			values[0] = CStringGetTextDatum(psprintf("%s (and recurse)", strtype));
+		else
+			values[0] = CStringGetTextDatum(strtype);
 		if (OidIsValid(sub->address.objectId))
 		{
 			char	   *objdesc;
+
 			objdesc = getObjectDescription((const ObjectAddress *) &sub->address, false);
 			values[1] = CStringGetTextDatum(objdesc);
 		}

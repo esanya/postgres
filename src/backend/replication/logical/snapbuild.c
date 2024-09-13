@@ -41,10 +41,15 @@
  * transactions we need Snapshots that see intermediate versions of the
  * catalog in a transaction. During normal operation this is achieved by using
  * CommandIds/cmin/cmax. The problem with that however is that for space
- * efficiency reasons only one value of that is stored
- * (cf. combocid.c). Since combo CIDs are only available in memory we log
- * additional information which allows us to get the original (cmin, cmax)
- * pair during visibility checks. Check the reorderbuffer.c's comment above
+ * efficiency reasons, the cmin and cmax are not included in WAL records. We
+ * cannot read the cmin/cmax from the tuple itself, either, because it is
+ * reset on crash recovery. Even if we could, we could not decode combocids
+ * which are only tracked in the original backend's memory. To work around
+ * that, heapam writes an extra WAL record (XLOG_HEAP2_NEW_CID) every time a
+ * catalog row is modified, which includes the cmin and cmax of the
+ * tuple. During decoding, we insert the ctid->(cmin,cmax) mappings into the
+ * reorder buffer, and use them at visibility checks instead of the cmin/cmax
+ * on the tuple itself. Check the reorderbuffer.c's comment above
  * ResolveCminCmaxDuringDecoding() for details.
  *
  * To facilitate all this we need our own visibility routine, as the normal
@@ -93,7 +98,7 @@
  * Initially the machinery is in the START stage. When an xl_running_xacts
  * record is read that is sufficiently new (above the safe xmin horizon),
  * there's a state transition. If there were no running xacts when the
- * running_xacts record was generated, we'll directly go into CONSISTENT
+ * xl_running_xacts record was generated, we'll directly go into CONSISTENT
  * state, otherwise we'll switch to the BUILDING_SNAPSHOT state. Having a full
  * snapshot means that all transactions that start henceforth can be decoded
  * in their entirety, but transactions that started previously can't. In
@@ -107,7 +112,7 @@
  * is a convenient point to initialize replication from, which is why we
  * export a snapshot at that point, which *can* be used to read normal data.
  *
- * Copyright (c) 2012-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/snapbuild.c
@@ -129,7 +134,6 @@
 #include "replication/logical.h"
 #include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
-#include "storage/block.h"		/* debugging output */
 #include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
@@ -184,6 +188,14 @@ struct SnapBuild
 
 	/* Indicates if we are building full snapshot or just catalog one. */
 	bool		building_full_snapshot;
+
+	/*
+	 * Indicates if we are using the snapshot builder for the creation of a
+	 * logical replication slot. If it's true, the start point for decoding
+	 * changes is not determined yet. So we skip snapshot restores to properly
+	 * find the start point. See SnapBuildFindSnapshot() for details.
+	 */
+	bool		in_slot_creation;
 
 	/*
 	 * Snapshot that's valid to see the catalog state seen at this moment.
@@ -313,6 +325,7 @@ AllocateSnapshotBuilder(ReorderBuffer *reorder,
 						TransactionId xmin_horizon,
 						XLogRecPtr start_lsn,
 						bool need_full_snapshot,
+						bool in_slot_creation,
 						XLogRecPtr two_phase_at)
 {
 	MemoryContext context;
@@ -343,6 +356,7 @@ AllocateSnapshotBuilder(ReorderBuffer *reorder,
 
 	builder->initial_xmin_horizon = xmin_horizon;
 	builder->start_decoding_at = start_lsn;
+	builder->in_slot_creation = in_slot_creation;
 	builder->building_full_snapshot = need_full_snapshot;
 	builder->two_phase_at = two_phase_at;
 
@@ -566,11 +580,18 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
 {
 	Snapshot	snap;
 	TransactionId xid;
+	TransactionId safeXid;
 	TransactionId *newxip;
 	int			newxcnt = 0;
 
-	Assert(!FirstSnapshotSet);
 	Assert(XactIsoLevel == XACT_REPEATABLE_READ);
+	Assert(builder->building_full_snapshot);
+
+	/* don't allow older snapshots */
+	InvalidateCatalogSnapshot();	/* about to overwrite MyProc->xmin */
+	if (HaveRegisteredOrActiveSnapshot())
+		elog(ERROR, "cannot build an initial slot snapshot when snapshots exist");
+	Assert(!HistoricSnapshotActive());
 
 	if (builder->state != SNAPBUILD_CONSISTENT)
 		elog(ERROR, "cannot build an initial slot snapshot before reaching a consistent state");
@@ -588,18 +609,18 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
 	 * We know that snap->xmin is alive, enforced by the logical xmin
 	 * mechanism. Due to that we can do this without locks, we're only
 	 * changing our own value.
+	 *
+	 * Building an initial snapshot is expensive and an unenforced xmin
+	 * horizon would have bad consequences, therefore always double-check that
+	 * the horizon is enforced.
 	 */
-#ifdef USE_ASSERT_CHECKING
-	{
-		TransactionId safeXid;
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	safeXid = GetOldestSafeDecodingTransactionId(false);
+	LWLockRelease(ProcArrayLock);
 
-		LWLockAcquire(ProcArrayLock, LW_SHARED);
-		safeXid = GetOldestSafeDecodingTransactionId(false);
-		LWLockRelease(ProcArrayLock);
-
-		Assert(TransactionIdPrecedesOrEquals(safeXid, snap->xmin));
-	}
-#endif
+	if (TransactionIdFollows(safeXid, snap->xmin))
+		elog(ERROR, "cannot build an initial slot snapshot as oldest safe xid %u follows snapshot's xmin %u",
+			 safeXid, snap->xmin);
 
 	MyProc->xmin = snap->xmin;
 
@@ -1316,10 +1337,12 @@ SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *runn
 	 *	  state while waiting on c)'s sub-states.
 	 *
 	 * b) This (in a previous run) or another decoding slot serialized a
-	 *	  snapshot to disk that we can use.  Can't use this method for the
-	 *	  initial snapshot when slot is being created and needs full snapshot
-	 *	  for export or direct use, as that snapshot will only contain catalog
-	 *	  modifying transactions.
+	 *	  snapshot to disk that we can use. Can't use this method while finding
+	 *	  the start point for decoding changes as the restart LSN would be an
+	 *	  arbitrary LSN but we need to find the start point to extract changes
+	 *	  where we won't see the data for partial transactions. Also, we cannot
+	 *	  use this method when a slot needs a full snapshot for export or direct
+	 *	  use, as that snapshot will only contain catalog modifying transactions.
 	 *
 	 * c) First incrementally build a snapshot for catalog tuples
 	 *	  (BUILDING_SNAPSHOT), that requires all, already in-progress,
@@ -1331,8 +1354,8 @@ SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *runn
 	 */
 
 	/*
-	 * xl_running_xact record is older than what we can use, we might not have
-	 * all necessary catalog rows anymore.
+	 * xl_running_xacts record is older than what we can use, we might not
+	 * have all necessary catalog rows anymore.
 	 */
 	if (TransactionIdIsNormal(builder->initial_xmin_horizon) &&
 		NormalTransactionIdPrecedes(running->oldestRunningXid,
@@ -1384,8 +1407,13 @@ SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *runn
 
 		return false;
 	}
-	/* b) valid on disk state and not building full snapshot */
+
+	/*
+	 * b) valid on disk state and while neither building full snapshot nor
+	 * creating a slot.
+	 */
 	else if (!builder->building_full_snapshot &&
+			 !builder->in_slot_creation &&
 			 SnapBuildRestore(builder, lsn))
 	{
 		/* there won't be any state to cleanup */
@@ -1399,7 +1427,7 @@ SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *runn
 	 * encountered.  In that case, switch to BUILDING_SNAPSHOT state, and
 	 * record xl_running_xacts->nextXid.  Once all running xacts have finished
 	 * (i.e. they're all >= nextXid), we have a complete catalog snapshot.  It
-	 * might look that we could use xl_running_xact's ->xids information to
+	 * might look that we could use xl_running_xacts's ->xids information to
 	 * get there quicker, but that is problematic because transactions marked
 	 * as running, might already have inserted their commit record - it's
 	 * infeasible to change that with locking.
@@ -1457,11 +1485,10 @@ SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *runn
 	/*
 	 * c) transition from FULL_SNAPSHOT to CONSISTENT.
 	 *
-	 * In FULL_SNAPSHOT state (see d) ), and this xl_running_xacts'
-	 * oldestRunningXid is >= than nextXid from when we switched to
-	 * FULL_SNAPSHOT.  This means all transactions that are currently in
-	 * progress have a catalog snapshot, and all their changes have been
-	 * collected.  Switch to CONSISTENT.
+	 * In FULL_SNAPSHOT state, and this xl_running_xacts' oldestRunningXid is
+	 * >= than nextXid from when we switched to FULL_SNAPSHOT.  This means all
+	 * transactions that are currently in progress have a catalog snapshot,
+	 * and all their changes have been collected.  Switch to CONSISTENT.
 	 */
 	else if (builder->state == SNAPBUILD_FULL_SNAPSHOT &&
 			 TransactionIdPrecedesOrEquals(builder->next_phase_at,
@@ -1570,7 +1597,7 @@ typedef struct SnapBuildOnDisk
 	offsetof(SnapBuildOnDisk, version)
 
 #define SNAPBUILD_MAGIC 0x51A1E001
-#define SNAPBUILD_VERSION 5
+#define SNAPBUILD_VERSION 6
 
 /*
  * Store/Load a snapshot from disk, depending on the snapshot builder's state.
@@ -1627,7 +1654,8 @@ SnapBuildSerialize(SnapBuild *builder, XLogRecPtr lsn)
 	 * unless the user used pg_resetwal or similar. If a user did so, there's
 	 * no hope continuing to decode anyway.
 	 */
-	sprintf(path, "pg_logical/snapshots/%X-%X.snap",
+	sprintf(path, "%s/%X-%X.snap",
+			PG_LOGICAL_SNAPSHOTS_DIR,
 			LSN_FORMAT_ARGS(lsn));
 
 	/*
@@ -1654,7 +1682,7 @@ SnapBuildSerialize(SnapBuild *builder, XLogRecPtr lsn)
 		 * be safely on disk.
 		 */
 		fsync_fname(path, false);
-		fsync_fname("pg_logical/snapshots", true);
+		fsync_fname(PG_LOGICAL_SNAPSHOTS_DIR, true);
 
 		builder->last_serialized_snapshot = lsn;
 		goto out;
@@ -1670,7 +1698,8 @@ SnapBuildSerialize(SnapBuild *builder, XLogRecPtr lsn)
 	elog(DEBUG1, "serializing snapshot to %s", path);
 
 	/* to make sure only we will write to this tempfile, include pid */
-	sprintf(tmppath, "pg_logical/snapshots/%X-%X.snap.%d.tmp",
+	sprintf(tmppath, "%s/%X-%X.snap.%d.tmp",
+			PG_LOGICAL_SNAPSHOTS_DIR,
 			LSN_FORMAT_ARGS(lsn), MyProcPid);
 
 	/*
@@ -1791,7 +1820,7 @@ SnapBuildSerialize(SnapBuild *builder, XLogRecPtr lsn)
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", tmppath)));
 
-	fsync_fname("pg_logical/snapshots", true);
+	fsync_fname(PG_LOGICAL_SNAPSHOTS_DIR, true);
 
 	/*
 	 * We may overwrite the work from some other backend, but that's ok, our
@@ -1807,10 +1836,10 @@ SnapBuildSerialize(SnapBuild *builder, XLogRecPtr lsn)
 
 	/* make sure we persist */
 	fsync_fname(path, false);
-	fsync_fname("pg_logical/snapshots", true);
+	fsync_fname(PG_LOGICAL_SNAPSHOTS_DIR, true);
 
 	/*
-	 * Now there's no way we can loose the dumped state anymore, remember this
+	 * Now there's no way we can lose the dumped state anymore, remember this
 	 * as a serialization point.
 	 */
 	builder->last_serialized_snapshot = lsn;
@@ -1844,7 +1873,8 @@ SnapBuildRestore(SnapBuild *builder, XLogRecPtr lsn)
 	if (builder->state == SNAPBUILD_CONSISTENT)
 		return false;
 
-	sprintf(path, "pg_logical/snapshots/%X-%X.snap",
+	sprintf(path, "%s/%X-%X.snap",
+			PG_LOGICAL_SNAPSHOTS_DIR,
 			LSN_FORMAT_ARGS(lsn));
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
@@ -1865,7 +1895,7 @@ SnapBuildRestore(SnapBuild *builder, XLogRecPtr lsn)
 	 * ----
 	 */
 	fsync_fname(path, false);
-	fsync_fname("pg_logical/snapshots", true);
+	fsync_fname(PG_LOGICAL_SNAPSHOTS_DIR, true);
 
 
 	/* read statically sized portion of snapshot */
@@ -1944,8 +1974,12 @@ SnapBuildRestore(SnapBuild *builder, XLogRecPtr lsn)
 	if (TransactionIdPrecedes(ondisk.builder.xmin, builder->initial_xmin_horizon))
 		goto snapshot_not_interesting;
 
-	/* consistent snapshots have no next phase */
+	/*
+	 * Consistent snapshots have no next phase. Reset next_phase_at as it is
+	 * possible that an old value may remain.
+	 */
 	Assert(ondisk.builder.next_phase_at == InvalidTransactionId);
+	builder->next_phase_at = InvalidTransactionId;
 
 	/* ok, we think the snapshot is sensible, copy over everything important */
 	builder->xmin = ondisk.builder.xmin;
@@ -2024,7 +2058,7 @@ SnapBuildRestoreContents(int fd, char *dest, Size size, const char *path)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("could not read file \"%s\": read %d of %zu",
-							path, readBytes, sizeof(SnapBuild))));
+							path, readBytes, size)));
 	}
 }
 
@@ -2043,7 +2077,7 @@ CheckPointSnapBuild(void)
 	XLogRecPtr	redo;
 	DIR		   *snap_dir;
 	struct dirent *snap_de;
-	char		path[MAXPGPATH + 21];
+	char		path[MAXPGPATH + sizeof(PG_LOGICAL_SNAPSHOTS_DIR)];
 
 	/*
 	 * We start off with a minimum of the last redo pointer. No new
@@ -2059,8 +2093,8 @@ CheckPointSnapBuild(void)
 	if (redo < cutoff)
 		cutoff = redo;
 
-	snap_dir = AllocateDir("pg_logical/snapshots");
-	while ((snap_de = ReadDir(snap_dir, "pg_logical/snapshots")) != NULL)
+	snap_dir = AllocateDir(PG_LOGICAL_SNAPSHOTS_DIR);
+	while ((snap_de = ReadDir(snap_dir, PG_LOGICAL_SNAPSHOTS_DIR)) != NULL)
 	{
 		uint32		hi;
 		uint32		lo;
@@ -2071,7 +2105,7 @@ CheckPointSnapBuild(void)
 			strcmp(snap_de->d_name, "..") == 0)
 			continue;
 
-		snprintf(path, sizeof(path), "pg_logical/snapshots/%s", snap_de->d_name);
+		snprintf(path, sizeof(path), "%s/%s", PG_LOGICAL_SNAPSHOTS_DIR, snap_de->d_name);
 		de_type = get_dirent_type(path, snap_de, false, DEBUG1);
 
 		if (de_type != PGFILETYPE_ERROR && de_type != PGFILETYPE_REG)
@@ -2119,4 +2153,28 @@ CheckPointSnapBuild(void)
 		}
 	}
 	FreeDir(snap_dir);
+}
+
+/*
+ * Check if a logical snapshot at the specified point has been serialized.
+ */
+bool
+SnapBuildSnapshotExists(XLogRecPtr lsn)
+{
+	char		path[MAXPGPATH];
+	int			ret;
+	struct stat stat_buf;
+
+	sprintf(path, "%s/%X-%X.snap",
+			PG_LOGICAL_SNAPSHOTS_DIR,
+			LSN_FORMAT_ARGS(lsn));
+
+	ret = stat(path, &stat_buf);
+
+	if (ret != 0 && errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat file \"%s\": %m", path)));
+
+	return ret == 0;
 }

@@ -3,7 +3,7 @@
  * dsm.h
  *	  manage dynamic shared memory segments
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/dsm.h
@@ -18,9 +18,6 @@
 typedef struct dsm_segment dsm_segment;
 
 #define DSM_CREATE_NULL_IF_MAXSEGMENTS			0x0001
-
-/* A sentinel value for an invalid DSM handle. */
-#define DSM_HANDLE_INVALID 0
 
 /* Startup and shutdown functions. */
 struct PGShmemHeader;			/* avoid including pg_shmem.h */

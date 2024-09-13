@@ -79,6 +79,10 @@ CREATE PUBLICATION testpub_for_tbl_schema FOR TABLES IN SCHEMA pub_test, TABLE p
 RESET client_min_messages;
 \dRp+ testpub_for_tbl_schema
 
+-- weird parser corner case
+CREATE PUBLICATION testpub_parsertst FOR TABLE pub_test.testpub_nopk, CURRENT_SCHEMA;
+CREATE PUBLICATION testpub_parsertst FOR TABLES IN SCHEMA foo, test.foo;
+
 -- should be able to add a table of the same schema to the schema publication
 ALTER PUBLICATION testpub_forschema ADD TABLE pub_test.testpub_nopk;
 \dRp+ testpub_forschema
@@ -413,6 +417,10 @@ ALTER PUBLICATION testpub_fortable DROP TABLE testpub_tbl5;
 ALTER PUBLICATION testpub_fortable ADD TABLE testpub_tbl5 (a, d);
 -- error: system attributes "ctid" not allowed in column list
 ALTER PUBLICATION testpub_fortable ADD TABLE testpub_tbl5 (a, ctid);
+ALTER PUBLICATION testpub_fortable SET TABLE testpub_tbl1 (id, ctid);
+-- error: duplicates not allowed in column list
+ALTER PUBLICATION testpub_fortable ADD TABLE testpub_tbl5 (a, a);
+ALTER PUBLICATION testpub_fortable SET TABLE testpub_tbl5 (a, a);
 -- ok
 ALTER PUBLICATION testpub_fortable ADD TABLE testpub_tbl5 (a, c);
 ALTER TABLE testpub_tbl5 DROP COLUMN c;		-- no dice
@@ -439,6 +447,15 @@ CREATE PUBLICATION testpub_table_ins WITH (publish = 'insert, truncate');
 RESET client_min_messages;
 ALTER PUBLICATION testpub_table_ins ADD TABLE testpub_tbl5 (a);		-- ok
 \dRp+ testpub_table_ins
+
+-- error: cannot work with deferrable primary keys
+CREATE TABLE testpub_tbl5d (a int PRIMARY KEY DEFERRABLE);
+ALTER PUBLICATION testpub_fortable ADD TABLE testpub_tbl5d;
+UPDATE testpub_tbl5d SET a = 1;
+/* but works fine with FULL replica identity */
+ALTER TABLE testpub_tbl5d REPLICA IDENTITY FULL;
+UPDATE testpub_tbl5d SET a = 1;
+DROP TABLE testpub_tbl5d;
 
 -- tests with REPLICA IDENTITY FULL
 CREATE TABLE testpub_tbl6 (a int, b text, c text);
@@ -590,10 +607,10 @@ ALTER TABLE rf_tbl_abcd_part_pk ATTACH PARTITION rf_tbl_abcd_part_pk_1 FOR VALUE
 SET client_min_messages = 'ERROR';
 CREATE PUBLICATION testpub6 FOR TABLE rf_tbl_abcd_pk (a, b);
 RESET client_min_messages;
--- ok - (a,b) coverts all PK cols
+-- ok - (a,b) covers all PK cols
 UPDATE rf_tbl_abcd_pk SET a = 1;
 ALTER PUBLICATION testpub6 SET TABLE rf_tbl_abcd_pk (a, b, c);
--- ok - (a,b,c) coverts all PK cols
+-- ok - (a,b,c) covers all PK cols
 UPDATE rf_tbl_abcd_pk SET a = 1;
 ALTER PUBLICATION testpub6 SET TABLE rf_tbl_abcd_pk (a);
 -- fail - "b" is missing from the column list

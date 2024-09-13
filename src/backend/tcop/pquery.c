@@ -3,7 +3,7 @@
  * pquery.c
  *	  POSTGRES process query command code
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -157,7 +157,7 @@ ProcessQuery(PlannedStmt *plan,
 	/*
 	 * Run the plan to completion.
 	 */
-	ExecutorRun(queryDesc, ForwardScanDirection, 0L, true);
+	ExecutorRun(queryDesc, ForwardScanDirection, 0, true);
 
 	/*
 	 * Build command completion status data, if caller wants one.
@@ -1168,10 +1168,11 @@ PortalRunUtility(Portal portal, PlannedStmt *pstmt,
 	MemoryContextSwitchTo(portal->portalContext);
 
 	/*
-	 * Some utility commands (e.g., VACUUM) pop the ActiveSnapshot stack from
-	 * under us, so don't complain if it's now empty.  Otherwise, our snapshot
-	 * should be the top one; pop it.  Note that this could be a different
-	 * snapshot from the one we made above; see EnsurePortalSnapshotExists.
+	 * Some utility commands (e.g., VACUUM, CALL pg_wal_replay_wait()) pop the
+	 * ActiveSnapshot stack from under us, so don't complain if it's now
+	 * empty.  Otherwise, our snapshot should be the top one; pop it.  Note
+	 * that this could be a different snapshot from the one we made above; see
+	 * EnsurePortalSnapshotExists.
 	 */
 	if (portal->portalSnapshot != NULL && ActiveSnapshotSet())
 	{

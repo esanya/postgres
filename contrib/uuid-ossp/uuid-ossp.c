@@ -2,7 +2,7 @@
  *
  * UUID generation functions using the BSD, E2FS or OSSP UUID library
  *
- * Copyright (c) 2007-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2024, PostgreSQL Global Development Group
  *
  * Portions Copyright (c) 2009 Andrew Gierth
  *
@@ -13,12 +13,13 @@
 
 #include "postgres.h"
 
-#include "fmgr.h"
 #include "common/cryptohash.h"
 #include "common/sha1.h"
+#include "fmgr.h"
 #include "port/pg_bswap.h"
 #include "utils/builtins.h"
 #include "utils/uuid.h"
+#include "varatt.h"
 
 /*
  * It's possible that there's more than one uuid.h header file present.

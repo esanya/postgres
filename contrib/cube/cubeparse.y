@@ -7,10 +7,18 @@
 #include "postgres.h"
 
 #include "cubedata.h"
+#include "nodes/miscnodes.h"
 #include "utils/float.h"
+#include "varatt.h"
 
 /* All grammar constructs return strings */
 #define YYSTYPE char *
+
+#include "cubeparse.h"
+
+/* silence -Wmissing-variable-declarations */
+extern int cube_yychar;
+extern int cube_yynerrs;
 
 /*
  * Bison doesn't allocate anything that needs to live across parser calls,
@@ -21,14 +29,17 @@
 #define YYFREE   pfree
 
 static int item_count(const char *s, char delim);
-static NDBOX *write_box(int dim, char *str1, char *str2);
-static NDBOX *write_point_as_box(int dim, char *str);
+static bool write_box(int dim, char *str1, char *str2,
+					  NDBOX **result, struct Node *escontext);
+static bool write_point_as_box(int dim, char *str,
+							   NDBOX **result, struct Node *escontext);
 
 %}
 
 /* BISON Declarations */
 %parse-param {NDBOX **result}
 %parse-param {Size scanbuflen}
+%parse-param {struct Node *escontext}
 %expect 0
 %name-prefix="cube_yy"
 
@@ -45,7 +56,7 @@ box: O_BRACKET paren_list COMMA paren_list C_BRACKET
 		dim = item_count($2, ',');
 		if (item_count($4, ',') != dim)
 		{
-			ereport(ERROR,
+			errsave(escontext,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid input syntax for cube"),
 					 errdetail("Different point dimensions in (%s) and (%s).",
@@ -54,7 +65,7 @@ box: O_BRACKET paren_list COMMA paren_list C_BRACKET
 		}
 		if (dim > CUBE_MAX_DIM)
 		{
-			ereport(ERROR,
+			errsave(escontext,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid input syntax for cube"),
 					 errdetail("A cube cannot have more than %d dimensions.",
@@ -62,7 +73,8 @@ box: O_BRACKET paren_list COMMA paren_list C_BRACKET
 			YYABORT;
 		}
 
-		*result = write_box( dim, $2, $4 );
+		if (!write_box(dim, $2, $4, result, escontext))
+			YYABORT;
 	}
 
 	| paren_list COMMA paren_list
@@ -72,7 +84,7 @@ box: O_BRACKET paren_list COMMA paren_list C_BRACKET
 		dim = item_count($1, ',');
 		if (item_count($3, ',') != dim)
 		{
-			ereport(ERROR,
+			errsave(escontext,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid input syntax for cube"),
 					 errdetail("Different point dimensions in (%s) and (%s).",
@@ -81,7 +93,7 @@ box: O_BRACKET paren_list COMMA paren_list C_BRACKET
 		}
 		if (dim > CUBE_MAX_DIM)
 		{
-			ereport(ERROR,
+			errsave(escontext,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid input syntax for cube"),
 					 errdetail("A cube cannot have more than %d dimensions.",
@@ -89,7 +101,8 @@ box: O_BRACKET paren_list COMMA paren_list C_BRACKET
 			YYABORT;
 		}
 
-		*result = write_box( dim, $1, $3 );
+		if (!write_box(dim, $1, $3, result, escontext))
+			YYABORT;
 	}
 
 	| paren_list
@@ -99,7 +112,7 @@ box: O_BRACKET paren_list COMMA paren_list C_BRACKET
 		dim = item_count($1, ',');
 		if (dim > CUBE_MAX_DIM)
 		{
-			ereport(ERROR,
+			errsave(escontext,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid input syntax for cube"),
 					 errdetail("A cube cannot have more than %d dimensions.",
@@ -107,7 +120,8 @@ box: O_BRACKET paren_list COMMA paren_list C_BRACKET
 			YYABORT;
 		}
 
-		*result = write_point_as_box(dim, $1);
+		if (!write_point_as_box(dim, $1, result, escontext))
+			YYABORT;
 	}
 
 	| list
@@ -117,7 +131,7 @@ box: O_BRACKET paren_list COMMA paren_list C_BRACKET
 		dim = item_count($1, ',');
 		if (dim > CUBE_MAX_DIM)
 		{
-			ereport(ERROR,
+			errsave(escontext,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid input syntax for cube"),
 					 errdetail("A cube cannot have more than %d dimensions.",
@@ -125,7 +139,8 @@ box: O_BRACKET paren_list COMMA paren_list C_BRACKET
 			YYABORT;
 		}
 
-		*result = write_point_as_box(dim, $1);
+		if (!write_point_as_box(dim, $1, result, escontext))
+			YYABORT;
 	}
 	;
 
@@ -173,8 +188,9 @@ item_count(const char *s, char delim)
 	return nitems;
 }
 
-static NDBOX *
-write_box(int dim, char *str1, char *str2)
+static bool
+write_box(int dim, char *str1, char *str2,
+		  NDBOX **result, struct Node *escontext)
 {
 	NDBOX	   *bp;
 	char	   *s;
@@ -190,18 +206,26 @@ write_box(int dim, char *str1, char *str2)
 	s = str1;
 	i = 0;
 	if (dim > 0)
-		bp->x[i++] = float8in_internal(s, &endptr, "cube", str1);
+	{
+		bp->x[i++] = float8in_internal(s, &endptr, "cube", str1, escontext);
+		if (SOFT_ERROR_OCCURRED(escontext))
+			return false;
+	}
 	while ((s = strchr(s, ',')) != NULL)
 	{
 		s++;
-		bp->x[i++] = float8in_internal(s, &endptr, "cube", str1);
+		bp->x[i++] = float8in_internal(s, &endptr, "cube", str1, escontext);
+		if (SOFT_ERROR_OCCURRED(escontext))
+			return false;
 	}
 	Assert(i == dim);
 
 	s = str2;
 	if (dim > 0)
 	{
-		bp->x[i] = float8in_internal(s, &endptr, "cube", str2);
+		bp->x[i] = float8in_internal(s, &endptr, "cube", str2, escontext);
+		if (SOFT_ERROR_OCCURRED(escontext))
+			return false;
 		/* code this way to do right thing with NaN */
 		point &= (bp->x[i] == bp->x[0]);
 		i++;
@@ -209,7 +233,9 @@ write_box(int dim, char *str1, char *str2)
 	while ((s = strchr(s, ',')) != NULL)
 	{
 		s++;
-		bp->x[i] = float8in_internal(s, &endptr, "cube", str2);
+		bp->x[i] = float8in_internal(s, &endptr, "cube", str2, escontext);
+		if (SOFT_ERROR_OCCURRED(escontext))
+			return false;
 		point &= (bp->x[i] == bp->x[i - dim]);
 		i++;
 	}
@@ -229,11 +255,13 @@ write_box(int dim, char *str1, char *str2)
 		SET_POINT_BIT(bp);
 	}
 
-	return bp;
+	*result = bp;
+	return true;
 }
 
-static NDBOX *
-write_point_as_box(int dim, char *str)
+static bool
+write_point_as_box(int dim, char *str,
+				   NDBOX **result, struct Node *escontext)
 {
 	NDBOX		*bp;
 	int			i,
@@ -250,13 +278,20 @@ write_point_as_box(int dim, char *str)
 	s = str;
 	i = 0;
 	if (dim > 0)
-		bp->x[i++] = float8in_internal(s, &endptr, "cube", str);
+	{
+		bp->x[i++] = float8in_internal(s, &endptr, "cube", str, escontext);
+		if (SOFT_ERROR_OCCURRED(escontext))
+			return false;
+	}
 	while ((s = strchr(s, ',')) != NULL)
 	{
 		s++;
-		bp->x[i++] = float8in_internal(s, &endptr, "cube", str);
+		bp->x[i++] = float8in_internal(s, &endptr, "cube", str, escontext);
+		if (SOFT_ERROR_OCCURRED(escontext))
+			return false;
 	}
 	Assert(i == dim);
 
-	return bp;
+	*result = bp;
+	return true;
 }

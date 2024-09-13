@@ -7,7 +7,7 @@
  *		A big hack of the regexp.c code!! Contributed by
  *		Keith Parks <emkxp01@mtcc.demon.co.uk> (7/95).
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,8 +22,9 @@
 #include "catalog/pg_collation.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/pg_locale.h"
+#include "varatt.h"
 
 
 #define LIKE_TRUE						1
@@ -94,12 +95,8 @@ SB_lower_char(unsigned char c, pg_locale_t locale, bool locale_is_c)
 {
 	if (locale_is_c)
 		return pg_ascii_tolower(c);
-#ifdef HAVE_LOCALE_T
-	else if (locale)
-		return tolower_l(c, locale->info.lt);
-#endif
 	else
-		return pg_tolower(c);
+		return tolower_l(c, locale->info.lt);
 }
 
 
@@ -150,11 +147,11 @@ SB_lower_char(unsigned char c, pg_locale_t locale, bool locale_is_c)
 static inline int
 GenericMatchText(const char *s, int slen, const char *p, int plen, Oid collation)
 {
-	if (collation && !lc_ctype_is_c(collation))
+	if (collation)
 	{
 		pg_locale_t locale = pg_newlocale_from_collation(collation);
 
-		if (locale && !locale->deterministic)
+		if (!locale->deterministic)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("nondeterministic collations are not supported for LIKE")));
@@ -175,8 +172,7 @@ Generic_Text_IC_like(text *str, text *pat, Oid collation)
 			   *p;
 	int			slen,
 				plen;
-	pg_locale_t locale = 0;
-	bool		locale_is_c = false;
+	pg_locale_t locale;
 
 	if (!OidIsValid(collation))
 	{
@@ -190,12 +186,9 @@ Generic_Text_IC_like(text *str, text *pat, Oid collation)
 				 errhint("Use the COLLATE clause to set the collation explicitly.")));
 	}
 
-	if (lc_ctype_is_c(collation))
-		locale_is_c = true;
-	else
-		locale = pg_newlocale_from_collation(collation);
+	locale = pg_newlocale_from_collation(collation);
 
-	if (locale && !locale->deterministic)
+	if (!locale->deterministic)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("nondeterministic collations are not supported for ILIKE")));
@@ -208,7 +201,7 @@ Generic_Text_IC_like(text *str, text *pat, Oid collation)
 	 * way.
 	 */
 
-	if (pg_database_encoding_max_length() > 1 || (locale && locale->provider == COLLPROVIDER_ICU))
+	if (pg_database_encoding_max_length() > 1 || (locale->provider == COLLPROVIDER_ICU))
 	{
 		pat = DatumGetTextPP(DirectFunctionCall1Coll(lower, collation,
 													 PointerGetDatum(pat)));
@@ -229,7 +222,7 @@ Generic_Text_IC_like(text *str, text *pat, Oid collation)
 		plen = VARSIZE_ANY_EXHDR(pat);
 		s = VARDATA_ANY(str);
 		slen = VARSIZE_ANY_EXHDR(str);
-		return SB_IMatchText(s, slen, p, plen, locale, locale_is_c);
+		return SB_IMatchText(s, slen, p, plen, locale, locale->ctype_is_c);
 	}
 }
 

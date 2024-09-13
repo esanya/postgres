@@ -2,7 +2,7 @@
  *
  * walmethods.c - implementations of different ways to write received wal
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/walmethods.c
@@ -44,18 +44,18 @@ static Walfile *dir_open_for_write(WalWriteMethod *wwmethod,
 								   const char *pathname,
 								   const char *temp_suffix,
 								   size_t pad_to_size);
-static int dir_close(Walfile *f, WalCloseMethod method);
+static int	dir_close(Walfile *f, WalCloseMethod method);
 static bool dir_existsfile(WalWriteMethod *wwmethod, const char *pathname);
 static ssize_t dir_get_file_size(WalWriteMethod *wwmethod,
 								 const char *pathname);
 static char *dir_get_file_name(WalWriteMethod *wwmethod,
 							   const char *pathname, const char *temp_suffix);
 static ssize_t dir_write(Walfile *f, const void *buf, size_t count);
-static int dir_sync(Walfile *f);
+static int	dir_sync(Walfile *f);
 static bool dir_finish(WalWriteMethod *wwmethod);
 static void dir_free(WalWriteMethod *wwmethod);
 
-const WalWriteMethodOps WalDirectoryMethodOps = {
+static const WalWriteMethodOps WalDirectoryMethodOps = {
 	.open_for_write = dir_open_for_write,
 	.close = dir_close,
 	.existsfile = dir_existsfile,
@@ -72,7 +72,7 @@ const WalWriteMethodOps WalDirectoryMethodOps = {
  */
 typedef struct DirectoryMethodData
 {
-	WalWriteMethod	base;
+	WalWriteMethod base;
 	char	   *basedir;
 } DirectoryMethodData;
 
@@ -220,22 +220,21 @@ dir_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 	/* Do pre-padding on non-compressed files */
 	if (pad_to_size && wwmethod->compression_algorithm == PG_COMPRESSION_NONE)
 	{
-		PGAlignedXLogBlock zerobuf;
-		int			bytes;
+		ssize_t		rc;
 
-		memset(zerobuf.data, 0, XLOG_BLCKSZ);
-		for (bytes = 0; bytes < pad_to_size; bytes += XLOG_BLCKSZ)
+		rc = pg_pwrite_zeros(fd, pad_to_size, 0);
+
+		if (rc < 0)
 		{
-			errno = 0;
-			if (write(fd, zerobuf.data, XLOG_BLCKSZ) != XLOG_BLCKSZ)
-			{
-				/* If write didn't set errno, assume problem is no disk space */
-				wwmethod->lasterrno = errno ? errno : ENOSPC;
-				close(fd);
-				return NULL;
-			}
+			wwmethod->lasterrno = errno;
+			close(fd);
+			return NULL;
 		}
 
+		/*
+		 * pg_pwrite() (called via pg_pwrite_zeros()) may have moved the file
+		 * position, so reset it (see win32pwrite.c).
+		 */
 		if (lseek(fd, 0, SEEK_SET) != 0)
 		{
 			wwmethod->lasterrno = errno;
@@ -595,6 +594,11 @@ dir_existsfile(WalWriteMethod *wwmethod, const char *pathname)
 
 	fd = open(tmppath, O_RDONLY | PG_BINARY, 0);
 	if (fd < 0)
+
+		/*
+		 * Skip setting dir_data->lasterrno here because we are only checking
+		 * for existence.
+		 */
 		return false;
 	close(fd);
 	return true;
@@ -661,18 +665,18 @@ static Walfile *tar_open_for_write(WalWriteMethod *wwmethod,
 								   const char *pathname,
 								   const char *temp_suffix,
 								   size_t pad_to_size);
-static int tar_close(Walfile *f, WalCloseMethod method);
+static int	tar_close(Walfile *f, WalCloseMethod method);
 static bool tar_existsfile(WalWriteMethod *wwmethod, const char *pathname);
 static ssize_t tar_get_file_size(WalWriteMethod *wwmethod,
 								 const char *pathname);
 static char *tar_get_file_name(WalWriteMethod *wwmethod,
 							   const char *pathname, const char *temp_suffix);
 static ssize_t tar_write(Walfile *f, const void *buf, size_t count);
-static int tar_sync(Walfile *f);
+static int	tar_sync(Walfile *f);
 static bool tar_finish(WalWriteMethod *wwmethod);
 static void tar_free(WalWriteMethod *wwmethod);
 
-const WalWriteMethodOps WalTarMethodOps = {
+static const WalWriteMethodOps WalTarMethodOps = {
 	.open_for_write = tar_open_for_write,
 	.close = tar_close,
 	.existsfile = tar_existsfile,
@@ -694,7 +698,7 @@ typedef struct TarMethodFile
 
 typedef struct TarMethodData
 {
-	WalWriteMethod	base;
+	WalWriteMethod base;
 	char	   *tarfilename;
 	int			fd;
 	TarMethodFile *currentfile;
@@ -706,7 +710,7 @@ typedef struct TarMethodData
 
 #ifdef HAVE_LIBZ
 static bool
-tar_write_compressed_data(TarMethodData *tar_data, void *buf, size_t count,
+tar_write_compressed_data(TarMethodData *tar_data, const void *buf, size_t count,
 						  bool flush)
 {
 	tar_data->zp->next_in = buf;
@@ -719,7 +723,7 @@ tar_write_compressed_data(TarMethodData *tar_data, void *buf, size_t count,
 		r = deflate(tar_data->zp, flush ? Z_FINISH : Z_NO_FLUSH);
 		if (r == Z_STREAM_ERROR)
 		{
-			tar_data->base.lasterrstring = "could not compress data";
+			tar_data->base.lasterrstring = _("could not compress data");
 			return false;
 		}
 
@@ -748,7 +752,7 @@ tar_write_compressed_data(TarMethodData *tar_data, void *buf, size_t count,
 		/* Reset the stream for writing */
 		if (deflateReset(tar_data->zp) != Z_OK)
 		{
-			tar_data->base.lasterrstring = "could not reset compression stream";
+			tar_data->base.lasterrstring = _("could not reset compression stream");
 			return false;
 		}
 	}
@@ -783,8 +787,7 @@ tar_write(Walfile *f, const void *buf, size_t count)
 #ifdef HAVE_LIBZ
 	else if (f->wwmethod->compression_algorithm == PG_COMPRESSION_GZIP)
 	{
-		if (!tar_write_compressed_data(tar_data, unconstify(void *, buf),
-									   count, false))
+		if (!tar_write_compressed_data(tar_data, buf, count, false))
 			return -1;
 		f->currpos += count;
 		return count;
@@ -874,7 +877,7 @@ tar_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 				pg_free(tar_data->zp);
 				tar_data->zp = NULL;
 				wwmethod->lasterrstring =
-					"could not initialize compression library";
+					_("could not initialize compression library");
 				return NULL;
 			}
 		}
@@ -886,7 +889,7 @@ tar_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 	if (tar_data->currentfile != NULL)
 	{
 		wwmethod->lasterrstring =
-			"implementation error: tar files can't have more than one open file";
+			_("implementation error: tar files can't have more than one open file");
 		return NULL;
 	}
 
@@ -901,7 +904,7 @@ tar_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 		pg_free(tar_data->currentfile);
 		pg_free(tmppath);
 		tar_data->currentfile = NULL;
-		wwmethod->lasterrstring = "could not create tar header";
+		wwmethod->lasterrstring = _("could not create tar header");
 		return NULL;
 	}
 
@@ -918,7 +921,7 @@ tar_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 		if (deflateParams(tar_data->zp, 0, Z_DEFAULT_STRATEGY) != Z_OK)
 		{
 			wwmethod->lasterrstring =
-				"could not change compression parameters";
+				_("could not change compression parameters");
 			return NULL;
 		}
 	}
@@ -959,7 +962,7 @@ tar_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 		if (deflateParams(tar_data->zp, wwmethod->compression_level,
 						  Z_DEFAULT_STRATEGY) != Z_OK)
 		{
-			wwmethod->lasterrstring = "could not change compression parameters";
+			wwmethod->lasterrstring = _("could not change compression parameters");
 			return NULL;
 		}
 	}
@@ -1050,7 +1053,7 @@ tar_close(Walfile *f, WalCloseMethod method)
 	{
 		if (f->wwmethod->compression_algorithm != PG_COMPRESSION_NONE)
 		{
-			f->wwmethod->lasterrstring = "unlink not supported with compression";
+			f->wwmethod->lasterrstring = _("unlink not supported with compression");
 			return -1;
 		}
 
@@ -1132,7 +1135,7 @@ tar_close(Walfile *f, WalCloseMethod method)
 	 * possibly also renaming the file. We overwrite the entire current header
 	 * when done, including the checksum.
 	 */
-	print_tar_number(&(tf->header[124]), 12, filesize);
+	print_tar_number(&(tf->header[TAR_OFFSET_SIZE]), 12, filesize);
 
 	if (method == CLOSE_NORMAL)
 
@@ -1140,9 +1143,10 @@ tar_close(Walfile *f, WalCloseMethod method)
 		 * We overwrite it with what it was before if we have no tempname,
 		 * since we're going to write the buffer anyway.
 		 */
-		strlcpy(&(tf->header[0]), tf->base.pathname, 100);
+		strlcpy(&(tf->header[TAR_OFFSET_NAME]), tf->base.pathname, 100);
 
-	print_tar_number(&(tf->header[148]), 8, tarChecksum(((TarMethodFile *) f)->header));
+	print_tar_number(&(tf->header[TAR_OFFSET_CHECKSUM]), 8,
+					 tarChecksum(((TarMethodFile *) f)->header));
 	if (lseek(tar_data->fd, tf->ofs_start, SEEK_SET) != ((TarMethodFile *) f)->ofs_start)
 	{
 		f->wwmethod->lasterrno = errno;
@@ -1164,7 +1168,7 @@ tar_close(Walfile *f, WalCloseMethod method)
 		/* Turn off compression */
 		if (deflateParams(tar_data->zp, 0, Z_DEFAULT_STRATEGY) != Z_OK)
 		{
-			f->wwmethod->lasterrstring = "could not change compression parameters";
+			f->wwmethod->lasterrstring = _("could not change compression parameters");
 			return -1;
 		}
 
@@ -1177,7 +1181,7 @@ tar_close(Walfile *f, WalCloseMethod method)
 		if (deflateParams(tar_data->zp, f->wwmethod->compression_level,
 						  Z_DEFAULT_STRATEGY) != Z_OK)
 		{
-			f->wwmethod->lasterrstring = "could not change compression parameters";
+			f->wwmethod->lasterrstring = _("could not change compression parameters");
 			return -1;
 		}
 	}
@@ -1262,7 +1266,7 @@ tar_finish(WalWriteMethod *wwmethod)
 
 			if (r == Z_STREAM_ERROR)
 			{
-				wwmethod->lasterrstring = "could not compress data";
+				wwmethod->lasterrstring = _("could not compress data");
 				return false;
 			}
 			if (tar_data->zp->avail_out < ZLIB_OUT_SIZE)
@@ -1286,7 +1290,7 @@ tar_finish(WalWriteMethod *wwmethod)
 
 		if (deflateEnd(tar_data->zp) != Z_OK)
 		{
-			wwmethod->lasterrstring = "could not close compression stream";
+			wwmethod->lasterrstring = _("could not close compression stream");
 			return false;
 		}
 	}
@@ -1354,7 +1358,7 @@ CreateWalTarMethod(const char *tarbase,
 {
 	TarMethodData *wwmethod;
 	const char *suffix = (compression_algorithm == PG_COMPRESSION_GZIP) ?
-	".tar.gz" : ".tar";
+		".tar.gz" : ".tar";
 
 	wwmethod = pg_malloc0(sizeof(TarMethodData));
 	*((const WalWriteMethodOps **) &wwmethod->base.ops) =

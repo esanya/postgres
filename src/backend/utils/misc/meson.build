@@ -1,15 +1,17 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 backend_sources += files(
   'conffiles.c',
   'guc.c',
   'guc_funcs.c',
   'guc_tables.c',
   'help_config.c',
+  'injection_point.c',
   'pg_config.c',
   'pg_controldata.c',
   'pg_rusage.c',
   'ps_status.c',
   'queryenvironment.c',
-  'queryjumble.c',
   'rls.c',
   'sampling.c',
   'superuser.c',

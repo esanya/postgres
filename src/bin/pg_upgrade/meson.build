@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 pg_upgrade_sources = files(
   'check.c',
   'controldata.c',
@@ -36,9 +38,12 @@ tests += {
   'sd': meson.current_source_dir(),
   'bd': meson.current_build_dir(),
   'tap': {
+    'env': {'with_icu': icu.found() ? 'yes' : 'no'},
     'tests': [
       't/001_basic.pl',
       't/002_pg_upgrade.pl',
+      't/003_logical_slots.pl',
+      't/004_subscription.pl',
     ],
     'test_kwargs': {'priority': 40}, # pg_upgrade tests are slow
   },

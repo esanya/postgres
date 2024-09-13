@@ -38,7 +38,7 @@ typedef enum UserAuth
 	uaLDAP,
 	uaCert,
 	uaRADIUS,
-	uaPeer
+	uaPeer,
 #define USER_AUTH_LAST uaPeer	/* Must be last value of this enum */
 } UserAuth;
 
@@ -51,7 +51,7 @@ typedef enum IPCompareMethod
 	ipCmpMask,
 	ipCmpSameHost,
 	ipCmpSameNet,
-	ipCmpAll
+	ipCmpAll,
 } IPCompareMethod;
 
 typedef enum ConnType
@@ -68,13 +68,13 @@ typedef enum ClientCertMode
 {
 	clientCertOff,
 	clientCertCA,
-	clientCertFull
+	clientCertFull,
 } ClientCertMode;
 
 typedef enum ClientCertName
 {
 	clientCertCN,
-	clientCertDN
+	clientCertDN,
 } ClientCertName;
 
 /*
@@ -82,7 +82,7 @@ typedef enum ClientCertName
  * (pg_ident.conf or pg_hba.conf), together with whether the token has
  * been quoted.  If "string" begins with a slash, it may optionally
  * contain a regular expression (currently used for pg_ident.conf when
- * building IdentLines).
+ * building IdentLines and for pg_hba.conf when building HbaLines).
  */
 typedef struct AuthToken
 {
@@ -142,8 +142,8 @@ typedef struct IdentLine
 	int			linenumber;
 
 	char	   *usermap;
-	char	   *pg_role;
-	AuthToken  *token;
+	AuthToken  *system_user;
+	AuthToken  *pg_user;
 } IdentLine;
 
 /*
@@ -172,12 +172,15 @@ extern bool load_ident(void);
 extern const char *hba_authname(UserAuth auth_method);
 extern void hba_getauthmethod(hbaPort *port);
 extern int	check_usermap(const char *usermap_name,
-						  const char *pg_role, const char *auth_user,
+						  const char *pg_user, const char *system_user,
 						  bool case_insensitive);
 extern HbaLine *parse_hba_line(TokenizedAuthLine *tok_line, int elevel);
 extern IdentLine *parse_ident_line(TokenizedAuthLine *tok_line, int elevel);
 extern bool pg_isblank(const char c);
-extern MemoryContext tokenize_auth_file(const char *filename, FILE *file,
-										List **tok_lines, int elevel);
+extern FILE *open_auth_file(const char *filename, int elevel, int depth,
+							char **err_msg);
+extern void free_auth_file(FILE *file, int depth);
+extern void tokenize_auth_file(const char *filename, FILE *file,
+							   List **tok_lines, int elevel, int depth);
 
 #endif							/* HBA_H */

@@ -7,7 +7,7 @@
  * used by PostgreSQL, be they related to GUCs or authentication.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -35,12 +35,12 @@
 char *
 AbsoluteConfigLocation(const char *location, const char *calling_file)
 {
-	char		abs_path[MAXPGPATH];
-
 	if (is_absolute_path(location))
 		return pstrdup(location);
 	else
 	{
+		char		abs_path[MAXPGPATH];
+
 		if (calling_file != NULL)
 		{
 			strlcpy(abs_path, calling_file, sizeof(abs_path));

@@ -37,7 +37,7 @@ SHLIB_LINK += $(LLVM_LIBS)
 # Because this module includes C++ files, we need to use a C++
 # compiler for linking. Makefile.shlib uses $(COMPILER) to build
 # loadable modules.
-override COMPILER = $(CXX) $(CFLAGS)
+override COMPILER = $(CXX) $(CXXFLAGS)
 
 OBJS = \
 	$(WIN32RES)
@@ -71,6 +71,6 @@ uninstall-types:
 
 include $(top_srcdir)/src/Makefile.shlib
 
-clean distclean maintainer-clean: clean-lib
+clean distclean: clean-lib
 	rm -f $(OBJS)
 	rm -f llvmjit_types.bc

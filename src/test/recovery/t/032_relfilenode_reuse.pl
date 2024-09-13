@@ -1,16 +1,12 @@
+
+# Copyright (c) 2024, PostgreSQL Global Development Group
+
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use File::Basename;
-
-if (PostgreSQL::Test::Utils::has_wal_read_bug)
-{
-	# We'd prefer to use Test::More->builder->todo_start, but the bug causes
-	# this test file to die(), not merely to fail.
-	plan skip_all => 'filesystem bug';
-}
 
 
 my $node_primary = PostgreSQL::Test::Cluster->new('primary');
@@ -148,8 +144,8 @@ $node_primary->safe_psql('postgres',
 $node_primary->safe_psql('conflict_db', "UPDATE large SET datab = 7;");
 cause_eviction(\%psql_primary, \%psql_standby);
 $node_primary->safe_psql('conflict_db', "UPDATE large SET datab = 8;");
-$node_primary->safe_psql('postgres',    'DROP DATABASE conflict_db');
-$node_primary->safe_psql('postgres',    'DROP TABLESPACE test_tablespace');
+$node_primary->safe_psql('postgres', 'DROP DATABASE conflict_db');
+$node_primary->safe_psql('postgres', 'DROP TABLESPACE test_tablespace');
 
 $node_primary->safe_psql('postgres', 'REINDEX TABLE pg_database');
 
@@ -209,7 +205,6 @@ sub cause_eviction
 sub send_query_and_wait
 {
 	my ($psql, $query, $untl) = @_;
-	my $ret;
 
 	# For each query we run, we'll restart the timeout.  Otherwise the timeout
 	# would apply to the whole test script, and would need to be set very high

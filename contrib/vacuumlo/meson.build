@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 vacuumlo_sources = files(
   'vacuumlo.c',
 )

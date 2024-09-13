@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 ecpglib_sources = files(
   'connect.c',
   'data.c',
@@ -55,7 +57,7 @@ pkgconfig.generate(
   description: 'PostgreSQL libecpg library',
   url: pg_url,
   libraries: ecpglib_so,
-  libraries_private: [frontend_shlib_code, thread_dep],
+  libraries_private: [frontend_stlib_code, thread_dep],
   requires_private: ['libpgtypes', 'libpq'],
 )
 

@@ -5,7 +5,7 @@
  *	  strategy.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/buf_internals.h
@@ -15,6 +15,7 @@
 #ifndef BUFMGR_INTERNALS_H
 #define BUFMGR_INTERNALS_H
 
+#include "pgstat.h"
 #include "port/atomics.h"
 #include "storage/buf.h"
 #include "storage/bufmgr.h"
@@ -25,6 +26,7 @@
 #include "storage/smgr.h"
 #include "storage/spin.h"
 #include "utils/relcache.h"
+#include "utils/resowner.h"
 
 /*
  * Buffer state is a single 32-bit variable where following data is combined.
@@ -211,7 +213,7 @@ BufMappingPartitionLockByIndex(uint32 index)
  * is held.  Thus buffer header lock holder can do complex updates of the
  * state variable in single write, simultaneously with lock release (cleaning
  * BM_LOCKED flag).  On the other hand, updating of state without holding
- * buffer header lock is restricted to CAS, which insure that BM_LOCKED flag
+ * buffer header lock is restricted to CAS, which ensures that BM_LOCKED flag
  * is not set.  Atomic increment/decrement, OR/AND etc. are not allowed.
  *
  * An exception is that if we have the buffer pinned, its tag can't change
@@ -382,20 +384,48 @@ typedef struct CkptSortItem
 
 extern PGDLLIMPORT CkptSortItem *CkptBufferIds;
 
+/* ResourceOwner callbacks to hold buffer I/Os and pins */
+extern PGDLLIMPORT const ResourceOwnerDesc buffer_io_resowner_desc;
+extern PGDLLIMPORT const ResourceOwnerDesc buffer_pin_resowner_desc;
+
+/* Convenience wrappers over ResourceOwnerRemember/Forget */
+static inline void
+ResourceOwnerRememberBuffer(ResourceOwner owner, Buffer buffer)
+{
+	ResourceOwnerRemember(owner, Int32GetDatum(buffer), &buffer_pin_resowner_desc);
+}
+static inline void
+ResourceOwnerForgetBuffer(ResourceOwner owner, Buffer buffer)
+{
+	ResourceOwnerForget(owner, Int32GetDatum(buffer), &buffer_pin_resowner_desc);
+}
+static inline void
+ResourceOwnerRememberBufferIO(ResourceOwner owner, Buffer buffer)
+{
+	ResourceOwnerRemember(owner, Int32GetDatum(buffer), &buffer_io_resowner_desc);
+}
+static inline void
+ResourceOwnerForgetBufferIO(ResourceOwner owner, Buffer buffer)
+{
+	ResourceOwnerForget(owner, Int32GetDatum(buffer), &buffer_io_resowner_desc);
+}
+
 /*
  * Internal buffer management routines
  */
 /* bufmgr.c */
 extern void WritebackContextInit(WritebackContext *context, int *max_pending);
-extern void IssuePendingWritebacks(WritebackContext *context);
-extern void ScheduleBufferTagForWriteback(WritebackContext *context, BufferTag *tag);
+extern void IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context);
+extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
+										  IOContext io_context, BufferTag *tag);
 
 /* freelist.c */
+extern IOContext IOContextForStrategy(BufferAccessStrategy strategy);
 extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy,
-									 uint32 *buf_state);
+									 uint32 *buf_state, bool *from_ring);
 extern void StrategyFreeBuffer(BufferDesc *buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy,
-								 BufferDesc *buf);
+								 BufferDesc *buf, bool from_ring);
 
 extern int	StrategySyncStart(uint32 *complete_passes, uint32 *num_buf_alloc);
 extern void StrategyNotifyBgWriter(int bgwprocno);
@@ -413,11 +443,21 @@ extern int	BufTableInsert(BufferTag *tagPtr, uint32 hashcode, int buf_id);
 extern void BufTableDelete(BufferTag *tagPtr, uint32 hashcode);
 
 /* localbuf.c */
+extern bool PinLocalBuffer(BufferDesc *buf_hdr, bool adjust_usagecount);
+extern void UnpinLocalBuffer(Buffer buffer);
+extern void UnpinLocalBufferNoOwner(Buffer buffer);
 extern PrefetchBufferResult PrefetchLocalBuffer(SMgrRelation smgr,
 												ForkNumber forkNum,
 												BlockNumber blockNum);
 extern BufferDesc *LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum,
 									BlockNumber blockNum, bool *foundPtr);
+extern BlockNumber ExtendBufferedRelLocal(BufferManagerRelation bmr,
+										  ForkNumber fork,
+										  uint32 flags,
+										  uint32 extend_by,
+										  BlockNumber extend_upto,
+										  Buffer *buffers,
+										  uint32 *extended_by);
 extern void MarkLocalBufferDirty(Buffer buffer);
 extern void DropRelationLocalBuffers(RelFileLocator rlocator,
 									 ForkNumber forkNum,

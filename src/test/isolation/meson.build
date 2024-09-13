@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 # pg_regress_c helpfully provided by regress/meson.build
 
 isolation_sources = pg_regress_c + files(
@@ -33,7 +35,7 @@ pg_isolation_regress = executable('pg_isolation_regress',
   isolation_sources,
   c_args: pg_regress_cflags,
   include_directories: pg_regress_inc,
-  dependencies: frontend_code,
+  dependencies: [frontend_code, libpq],
   kwargs: default_bin_args + {
     'install_dir': dir_pgxs / 'src/test/isolation',
   },
@@ -67,5 +69,6 @@ tests += {
       'priority': 40,
       'timeout': 1000,
     },
+    'dbname': 'isolation_regression',
   },
 }

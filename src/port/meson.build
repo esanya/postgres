@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 pgport_sources = [
   'bsearch_arg.c',
   'chklocale.c',
@@ -18,7 +20,6 @@ pgport_sources = [
   'snprintf.c',
   'strerror.c',
   'tar.c',
-  'thread.c',
 ]
 
 if host_system == 'windows'
@@ -27,10 +28,13 @@ if host_system == 'windows'
     'kill.c',
     'open.c',
     'system.c',
+    'win32common.c',
     'win32dlopen.c',
     'win32env.c',
     'win32error.c',
     'win32fdatasync.c',
+    'win32fseek.c',
+    'win32gai_strerror.c',
     'win32getrusage.c',
     'win32link.c',
     'win32ntdll.c',
@@ -39,6 +43,10 @@ if host_system == 'windows'
     'win32security.c',
     'win32setlocale.c',
     'win32stat.c',
+  )
+elif host_system == 'cygwin'
+  pgport_sources += files(
+    'dirmod.c',
   )
 endif
 
@@ -58,11 +66,10 @@ replace_funcs_neg = [
   ['getpeereid'],
   ['inet_aton'],
   ['mkdtemp'],
-  ['preadv', 'HAVE_DECL_PREADV'],
-  ['pwritev', 'HAVE_DECL_PWRITEV'],
   ['strlcat'],
   ['strlcpy'],
   ['strnlen'],
+  ['strsep'],
 ]
 
 if host_system != 'windows'
@@ -77,6 +84,8 @@ replace_funcs_pos = [
   ['pg_crc32c_sse42', 'USE_SSE42_CRC32C_WITH_RUNTIME_CHECK', 'crc'],
   ['pg_crc32c_sse42_choose', 'USE_SSE42_CRC32C_WITH_RUNTIME_CHECK'],
   ['pg_crc32c_sb8', 'USE_SSE42_CRC32C_WITH_RUNTIME_CHECK'],
+  ['pg_popcount_avx512', 'USE_AVX512_POPCNT_WITH_RUNTIME_CHECK', 'popcnt'],
+  ['pg_popcount_avx512_choose', 'USE_AVX512_POPCNT_WITH_RUNTIME_CHECK', 'xsave'],
 
   # arm / aarch64
   ['pg_crc32c_armv8', 'USE_ARMV8_CRC32C'],
@@ -84,12 +93,15 @@ replace_funcs_pos = [
   ['pg_crc32c_armv8_choose', 'USE_ARMV8_CRC32C_WITH_RUNTIME_CHECK'],
   ['pg_crc32c_sb8', 'USE_ARMV8_CRC32C_WITH_RUNTIME_CHECK'],
 
+  # loongarch
+  ['pg_crc32c_loongarch', 'USE_LOONGARCH_CRC32C'],
+
   # generic fallback
   ['pg_crc32c_sb8', 'USE_SLICING_BY_8_CRC32C'],
 ]
 
-pgport_cflags = {'crc': cflags_crc}
-pgport_sources_cflags = {'crc': []}
+pgport_cflags = {'crc': cflags_crc, 'popcnt': cflags_popcnt, 'xsave': cflags_xsave}
+pgport_sources_cflags = {'crc': [], 'popcnt': [], 'xsave': []}
 
 foreach f : replace_funcs_neg
   func = f.get(0)
@@ -184,3 +196,6 @@ endforeach
 pgport_srv = pgport['_srv']
 pgport_static = pgport['']
 pgport_shlib = pgport['_shlib']
+
+# autoconf generates the file there, ensure we get a conflict
+generated_sources_ac += {'src/port': ['pg_config_paths.h']}

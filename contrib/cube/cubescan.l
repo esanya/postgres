@@ -63,7 +63,7 @@ NaN          [nN][aA][nN]
 \(           cube_yylval = "("; return O_PAREN;
 \)           cube_yylval = ")"; return C_PAREN;
 \,           cube_yylval = ","; return COMMA;
-[ \t\n\r\f]+ /* discard spaces */
+[ \t\n\r\f\v]+ /* discard spaces */
 .            return yytext[0]; /* alert parser of the garbage */
 
 %%
@@ -72,11 +72,13 @@ NaN          [nN][aA][nN]
 
 /* result and scanbuflen are not used, but Bison expects this signature */
 void
-cube_yyerror(NDBOX **result, Size scanbuflen, const char *message)
+cube_yyerror(NDBOX **result, Size scanbuflen,
+			 struct Node *escontext,
+			 const char *message)
 {
 	if (*yytext == YY_END_OF_BUFFER_CHAR)
 	{
-		ereport(ERROR,
+		errsave(escontext,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for cube"),
 				 /* translator: %s is typically "syntax error" */
@@ -84,7 +86,7 @@ cube_yyerror(NDBOX **result, Size scanbuflen, const char *message)
 	}
 	else
 	{
-		ereport(ERROR,
+		errsave(escontext,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for cube"),
 				 /* translator: first %s is typically "syntax error" */

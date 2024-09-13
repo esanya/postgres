@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 subdir('brin')
 subdir('common')
 subdir('gin')
@@ -7,6 +9,7 @@ subdir('heap')
 subdir('index')
 subdir('nbtree')
 subdir('rmgrdesc')
+subdir('sequence')
 subdir('spgist')
 subdir('table')
 subdir('tablesample')

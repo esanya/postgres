@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 scripts_common = static_library('libscripts_common',
   files('common.c'),
   dependencies: [frontend_code, libpq],
@@ -38,6 +40,7 @@ tests += {
   'sd': meson.current_source_dir(),
   'bd': meson.current_build_dir(),
   'tap': {
+    'env': {'with_icu': icu.found() ? 'yes' : 'no'},
     'tests': [
       't/010_clusterdb.pl',
       't/011_clusterdb_all.pl',

@@ -12,7 +12,7 @@
  * Note that other approaches to parameters are possible using the parser
  * hooks defined in ParseState.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,6 +31,7 @@
 #include "parser/parse_param.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 
 
 typedef struct FixedParamState
@@ -136,7 +137,7 @@ variable_paramref_hook(ParseState *pstate, ParamRef *pref)
 	Param	   *param;
 
 	/* Check parameter number is in range */
-	if (paramno <= 0 || paramno > INT_MAX / sizeof(Oid))
+	if (paramno <= 0 || paramno > MaxAllocSize / sizeof(Oid))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_PARAMETER),
 				 errmsg("there is no parameter $%d", paramno),
@@ -145,14 +146,10 @@ variable_paramref_hook(ParseState *pstate, ParamRef *pref)
 	{
 		/* Need to enlarge param array */
 		if (*parstate->paramTypes)
-			*parstate->paramTypes = (Oid *) repalloc(*parstate->paramTypes,
-													 paramno * sizeof(Oid));
+			*parstate->paramTypes = repalloc0_array(*parstate->paramTypes, Oid,
+													*parstate->numParams, paramno);
 		else
-			*parstate->paramTypes = (Oid *) palloc(paramno * sizeof(Oid));
-		/* Zero out the previously-unreferenced slots */
-		MemSet(*parstate->paramTypes + *parstate->numParams,
-			   0,
-			   (paramno - *parstate->numParams) * sizeof(Oid));
+			*parstate->paramTypes = palloc0_array(Oid, paramno);
 		*parstate->numParams = paramno;
 	}
 

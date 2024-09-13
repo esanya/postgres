@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 node_support_input_i = [
   'nodes/nodes.h',
   'nodes/primnodes.h',
@@ -13,8 +15,10 @@ node_support_input_i = [
   'commands/trigger.h',
   'executor/tuptable.h',
   'foreign/fdwapi.h',
+  'nodes/bitmapset.h',
   'nodes/extensible.h',
   'nodes/lockoptions.h',
+  'nodes/miscnodes.h',
   'nodes/replnodes.h',
   'nodes/supportnodes.h',
   'nodes/value.h',
@@ -32,9 +36,11 @@ node_support_output = [
   'readfuncs.funcs.c', 'readfuncs.switch.c',
   'copyfuncs.funcs.c', 'copyfuncs.switch.c',
   'equalfuncs.funcs.c', 'equalfuncs.switch.c',
+  'queryjumblefuncs.funcs.c', 'queryjumblefuncs.switch.c',
 ]
 node_support_install = [
   dir_include_server / 'nodes',
+  false, false,
   false, false,
   false, false,
   false, false,
@@ -44,6 +50,7 @@ node_support_install = [
 generated_nodes = custom_target('nodetags.h',
   input: node_support_input,
   output: node_support_output,
+  depend_files: catalog_pm,
   command: [
     perl, files('../../backend/nodes/gen_node_support.pl'),
     '-o', '@OUTDIR@',

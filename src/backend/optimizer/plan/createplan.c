@@ -5,7 +5,7 @@
  *	  Planning is complete, we just need to convert the selected
  *	  Path into a Plan.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -29,6 +29,7 @@
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/paramassign.h"
+#include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/plancat.h"
@@ -40,6 +41,7 @@
 #include "parser/parse_clause.h"
 #include "parser/parsetree.h"
 #include "partitioning/partprune.h"
+#include "tcop/tcopprot.h"
 #include "utils/lsyscache.h"
 
 
@@ -311,7 +313,8 @@ static ModifyTable *make_modifytable(PlannerInfo *root, Plan *subplan,
 									 List *updateColnosLists,
 									 List *withCheckOptionLists, List *returningLists,
 									 List *rowMarks, OnConflictExpr *onconflict,
-									 List *mergeActionLists, int epqParam);
+									 List *mergeActionLists, List *mergeJoinConditions,
+									 int epqParam);
 static GatherMerge *create_gather_merge_plan(PlannerInfo *root,
 											 GatherMergePath *best_path);
 
@@ -599,8 +602,27 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 	 * Detect whether we have any pseudoconstant quals to deal with.  Then, if
 	 * we'll need a gating Result node, it will be able to project, so there
 	 * are no requirements on the child's tlist.
+	 *
+	 * If this replaces a join, it must be a foreign scan or a custom scan,
+	 * and the FDW or the custom scan provider would have stored in the best
+	 * path the list of RestrictInfo nodes to apply to the join; check against
+	 * that list in that case.
 	 */
-	gating_clauses = get_gating_quals(root, scan_clauses);
+	if (IS_JOIN_REL(rel))
+	{
+		List	   *join_clauses;
+
+		Assert(best_path->pathtype == T_ForeignScan ||
+			   best_path->pathtype == T_CustomScan);
+		if (best_path->pathtype == T_ForeignScan)
+			join_clauses = ((ForeignPath *) best_path)->fdw_restrictinfo;
+		else
+			join_clauses = ((CustomPath *) best_path)->custom_restrictinfo;
+
+		gating_clauses = get_gating_quals(root, join_clauses);
+	}
+	else
+		gating_clauses = get_gating_quals(root, scan_clauses);
 	if (gating_clauses)
 		flags = 0;
 
@@ -1529,16 +1551,8 @@ create_merge_append_plan(PlannerInfo *root, MergeAppendPath *best_path,
 
 		prunequal = extract_actual_clauses(rel->baserestrictinfo, false);
 
-		if (best_path->path.param_info)
-		{
-			List	   *prmquals = best_path->path.param_info->ppi_clauses;
-
-			prmquals = extract_actual_clauses(prmquals, false);
-			prmquals = (List *) replace_nestloop_params(root,
-														(Node *) prmquals);
-
-			prunequal = list_concat(prunequal, prmquals);
-		}
+		/* We don't currently generate any parameterized MergeAppend paths */
+		Assert(best_path->path.param_info == NULL);
 
 		if (prunequal != NIL)
 			partpruneinfo = make_partition_pruneinfo(root, rel,
@@ -1974,16 +1988,11 @@ create_gather_merge_plan(PlannerInfo *root, GatherMergePath *best_path)
 										 &gm_plan->collations,
 										 &gm_plan->nullsFirst);
 
-
 	/*
 	 * All gather merge paths should have already guaranteed the necessary
-	 * sort order either by adding an explicit sort node or by using presorted
-	 * input. We can't simply add a sort here on additional pathkeys, because
-	 * we can't guarantee the sort would be safe. For example, expressions may
-	 * be volatile or otherwise parallel unsafe.
+	 * sort order.  See create_gather_merge_path.
 	 */
-	if (!pathkeys_contained_in(pathkeys, best_path->subpath->pathkeys))
-		elog(ERROR, "gather merge input not sufficiently sorted");
+	Assert(pathkeys_contained_in(pathkeys, best_path->subpath->pathkeys));
 
 	/* Now insert the subplan under GatherMerge. */
 	gm_plan->plan.lefttree = subplan;
@@ -2013,7 +2022,7 @@ create_projection_plan(PlannerInfo *root, ProjectionPath *best_path, int flags)
 	 * Convert our subpath to a Plan and determine whether we need a Result
 	 * node.
 	 *
-	 * In most cases where we don't need to project, creation_projection_path
+	 * In most cases where we don't need to project, create_projection_path
 	 * will have set dummypp, but not always.  First, some createplan.c
 	 * routines change the tlists of their nodes.  (An example is that
 	 * create_merge_append_plan might add resjunk sort columns to a
@@ -2402,7 +2411,7 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 	 * sizing.
 	 */
 	maxref = 0;
-	foreach(lc, root->parse->groupClause)
+	foreach(lc, root->processed_groupClause)
 	{
 		SortGroupClause *gc = (SortGroupClause *) lfirst(lc);
 
@@ -2413,7 +2422,7 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 	grouping_map = (AttrNumber *) palloc0((maxref + 1) * sizeof(AttrNumber));
 
 	/* Now look up the column numbers in the child's tlist */
-	foreach(lc, root->parse->groupClause)
+	foreach(lc, root->processed_groupClause)
 	{
 		SortGroupClause *gc = (SortGroupClause *) lfirst(lc);
 		TargetEntry *tle = get_sortgroupclause_tle(gc, subplan->targetlist);
@@ -2563,6 +2572,7 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
 								   0, NULL, NULL, NULL);
 
 		/* Must apply correct cost/width data to Limit node */
+		plan->disabled_nodes = mminfo->path->disabled_nodes;
 		plan->startup_cost = mminfo->path->startup_cost;
 		plan->total_cost = mminfo->pathcost;
 		plan->plan_rows = 1;
@@ -2631,12 +2641,7 @@ create_windowagg_plan(PlannerInfo *root, WindowAggPath *best_path)
 
 	/*
 	 * Convert SortGroupClause lists into arrays of attr indexes and equality
-	 * operators, as wanted by executor.  (Note: in principle, it's possible
-	 * to drop some of the sort columns, if they were proved redundant by
-	 * pathkey logic.  However, it doesn't seem worth going out of our way to
-	 * optimize such cases.  In any case, we must *not* remove the ordering
-	 * column for RANGE OFFSET cases, as the executor needs that for in_range
-	 * tests even if it's known to be equal to some partitioning column.)
+	 * operators, as wanted by executor.
 	 */
 	partColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numPart);
 	partOperators = (Oid *) palloc(sizeof(Oid) * numPart);
@@ -2691,7 +2696,7 @@ create_windowagg_plan(PlannerInfo *root, WindowAggPath *best_path)
 						  wc->inRangeColl,
 						  wc->inRangeAsc,
 						  wc->inRangeNullsFirst,
-						  wc->runCondition,
+						  best_path->runCondition,
 						  best_path->qual,
 						  best_path->topwindow,
 						  subplan);
@@ -2829,6 +2834,7 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
 							best_path->rowMarks,
 							best_path->onconflict,
 							best_path->mergeActionLists,
+							best_path->mergeJoinConditions,
 							best_path->epqParam);
 
 	copy_generic_path_info(&plan->plan, &best_path->path);
@@ -3015,6 +3021,9 @@ create_indexscan_plan(PlannerInfo *root,
 	/* it should be a base rel... */
 	Assert(baserelid > 0);
 	Assert(best_path->path.parent->rtekind == RTE_RELATION);
+	/* check the scan direction is valid */
+	Assert(best_path->indexscandir == ForwardScanDirection ||
+		   best_path->indexscandir == BackwardScanDirection);
 
 	/*
 	 * Extract the index qual expressions (stripped of RestrictInfos) from the
@@ -3711,13 +3720,22 @@ create_subqueryscan_plan(PlannerInfo *root, SubqueryScanPath *best_path,
 	/* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 
-	/* Replace any outer-relation variables with nestloop params */
+	/*
+	 * Replace any outer-relation variables with nestloop params.
+	 *
+	 * We must provide nestloop params for both lateral references of the
+	 * subquery and outer vars in the scan_clauses.  It's better to assign the
+	 * former first, because that code path requires specific param IDs, while
+	 * replace_nestloop_params can adapt to the IDs assigned by
+	 * process_subquery_nestloop_params.  This avoids possibly duplicating
+	 * nestloop params when the same Var is needed for both reasons.
+	 */
 	if (best_path->path.param_info)
 	{
-		scan_clauses = (List *)
-			replace_nestloop_params(root, (Node *) scan_clauses);
 		process_subquery_nestloop_params(root,
 										 rel->subplan_params);
+		scan_clauses = (List *)
+			replace_nestloop_params(root, (Node *) scan_clauses);
 	}
 
 	scan_plan = make_subqueryscan(tlist,
@@ -4148,18 +4166,29 @@ create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 	/* Copy cost data from Path to Plan; no need to make FDW do this */
 	copy_generic_path_info(&scan_plan->scan.plan, &best_path->path);
 
+	/* Copy user OID to access as; likewise no need to make FDW do this */
+	scan_plan->checkAsUser = rel->userid;
+
 	/* Copy foreign server OID; likewise, no need to make FDW do this */
 	scan_plan->fs_server = rel->serverid;
 
 	/*
 	 * Likewise, copy the relids that are represented by this foreign scan. An
-	 * upper rel doesn't have relids set, but it covers all the base relations
-	 * participating in the underlying scan, so use root's all_baserels.
+	 * upper rel doesn't have relids set, but it covers all the relations
+	 * participating in the underlying scan/join, so use root->all_query_rels.
 	 */
 	if (rel->reloptkind == RELOPT_UPPER_REL)
-		scan_plan->fs_relids = root->all_baserels;
+		scan_plan->fs_relids = root->all_query_rels;
 	else
 		scan_plan->fs_relids = best_path->path.parent->relids;
+
+	/*
+	 * Join relid sets include relevant outer joins, but FDWs may need to know
+	 * which are the included base rels.  That's a bit tedious to get without
+	 * access to the plan-time data structures, so compute it here.
+	 */
+	scan_plan->fs_base_relids = bms_difference(scan_plan->fs_relids,
+											   root->outer_join_rels);
 
 	/*
 	 * If this is a foreign join, and to make it valid to push down we had to
@@ -4325,6 +4354,22 @@ create_nestloop_plan(PlannerInfo *root,
 	Relids		outerrelids;
 	List	   *nestParams;
 	Relids		saveOuterRels = root->curOuterRels;
+
+	/*
+	 * If the inner path is parameterized by the topmost parent of the outer
+	 * rel rather than the outer rel itself, fix that.  (Nothing happens here
+	 * if it is not so parameterized.)
+	 */
+	best_path->jpath.innerjoinpath =
+		reparameterize_path_by_child(root,
+									 best_path->jpath.innerjoinpath,
+									 best_path->jpath.outerjoinpath->parent);
+
+	/*
+	 * Failure here probably means that reparameterize_path_by_child() is not
+	 * in sync with path_is_reparameterizable_by_child().
+	 */
+	Assert(best_path->jpath.innerjoinpath != NULL);
 
 	/* NestLoop can project, so no need to be picky about child tlists */
 	outer_plan = create_plan_recurse(root, best_path->jpath.outerjoinpath, 0);
@@ -5360,6 +5405,7 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
 static void
 copy_generic_path_info(Plan *dest, Path *src)
 {
+	dest->disabled_nodes = src->disabled_nodes;
 	dest->startup_cost = src->startup_cost;
 	dest->total_cost = src->total_cost;
 	dest->plan_rows = src->rows;
@@ -5375,6 +5421,7 @@ copy_generic_path_info(Plan *dest, Path *src)
 static void
 copy_plan_costsize(Plan *dest, Plan *src)
 {
+	dest->disabled_nodes = src->disabled_nodes;
 	dest->startup_cost = src->startup_cost;
 	dest->total_cost = src->total_cost;
 	dest->plan_rows = src->plan_rows;
@@ -5407,6 +5454,7 @@ label_sort_with_costsize(PlannerInfo *root, Sort *plan, double limit_tuples)
 	Assert(IsA(plan, Sort));
 
 	cost_sort(&sort_path, root, NIL,
+			  plan->plan.disabled_nodes,
 			  lefttree->total_cost,
 			  lefttree->plan_rows,
 			  lefttree->plan_width,
@@ -5794,14 +5842,16 @@ make_foreignscan(List *qptlist,
 	node->operation = CMD_SELECT;
 	node->resultRelation = 0;
 
-	/* fs_server will be filled in by create_foreignscan_plan */
+	/* checkAsUser, fs_server will be filled in by create_foreignscan_plan */
+	node->checkAsUser = InvalidOid;
 	node->fs_server = InvalidOid;
 	node->fdw_exprs = fdw_exprs;
 	node->fdw_private = fdw_private;
 	node->fdw_scan_tlist = fdw_scan_tlist;
 	node->fdw_recheck_quals = fdw_recheck_quals;
-	/* fs_relids will be filled in by create_foreignscan_plan */
+	/* fs_relids, fs_base_relids will be filled by create_foreignscan_plan */
 	node->fs_relids = NULL;
+	node->fs_base_relids = NULL;
 	/* fsSystemCol will be filled in by create_foreignscan_plan */
 	node->fsSystemCol = false;
 
@@ -6195,10 +6245,7 @@ prepare_sort_from_pathkeys(Plan *lefttree, List *pathkeys,
 			 * the pathkey's EquivalenceClass.  For now, we take the first
 			 * tlist item found in the EC. If there's no match, we'll generate
 			 * a resjunk entry using the first EC member that is an expression
-			 * in the input's vars.  (The non-const restriction only matters
-			 * if the EC is below_outer_join; but if it isn't, it won't
-			 * contain consts anyway, else we'd have discarded the pathkey as
-			 * redundant.)
+			 * in the input's vars.
 			 *
 			 * XXX if we have a choice, is there any way of figuring out which
 			 * might be cheapest to execute?  (For example, int4lt is likely
@@ -6481,6 +6528,8 @@ materialize_finished_plan(Plan *subplan)
 {
 	Plan	   *matplan;
 	Path		matpath;		/* dummy for result of cost_material */
+	Cost		initplan_cost;
+	bool		unsafe_initplans;
 
 	matplan = (Plan *) make_material(subplan);
 
@@ -6488,20 +6537,27 @@ materialize_finished_plan(Plan *subplan)
 	 * XXX horrid kluge: if there are any initPlans attached to the subplan,
 	 * move them up to the Material node, which is now effectively the top
 	 * plan node in its query level.  This prevents failure in
-	 * SS_finalize_plan(), which see for comments.  We don't bother adjusting
-	 * the subplan's cost estimate for this.
+	 * SS_finalize_plan(), which see for comments.
 	 */
 	matplan->initPlan = subplan->initPlan;
 	subplan->initPlan = NIL;
 
+	/* Move the initplans' cost delta, as well */
+	SS_compute_initplan_cost(matplan->initPlan,
+							 &initplan_cost, &unsafe_initplans);
+	subplan->startup_cost -= initplan_cost;
+	subplan->total_cost -= initplan_cost;
+
 	/* Set cost data */
 	cost_material(&matpath,
+				  subplan->disabled_nodes,
 				  subplan->startup_cost,
 				  subplan->total_cost,
 				  subplan->plan_rows,
 				  subplan->plan_width);
-	matplan->startup_cost = matpath.startup_cost;
-	matplan->total_cost = matpath.total_cost;
+	matplan->disabled_nodes = subplan->disabled_nodes;
+	matplan->startup_cost = matpath.startup_cost + initplan_cost;
+	matplan->total_cost = matpath.total_cost + initplan_cost;
 	matplan->plan_rows = subplan->plan_rows;
 	matplan->plan_width = subplan->plan_width;
 	matplan->parallel_aware = false;
@@ -6979,7 +7035,8 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 				 List *updateColnosLists,
 				 List *withCheckOptionLists, List *returningLists,
 				 List *rowMarks, OnConflictExpr *onconflict,
-				 List *mergeActionLists, int epqParam)
+				 List *mergeActionLists, List *mergeJoinConditions,
+				 int epqParam)
 {
 	ModifyTable *node = makeNode(ModifyTable);
 	List	   *fdw_private_list;
@@ -7049,6 +7106,7 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 	node->returningLists = returningLists;
 	node->rowMarks = rowMarks;
 	node->mergeActionLists = mergeActionLists;
+	node->mergeJoinConditions = mergeJoinConditions;
 	node->epqParam = epqParam;
 
 	/*
@@ -7078,36 +7136,46 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 			RelOptInfo *resultRel = root->simple_rel_array[rti];
 
 			fdwroutine = resultRel->fdwroutine;
-
-			/*
-			 * MERGE is not currently supported for foreign tables and we
-			 * already checked when the table mentioned in the query is
-			 * foreign; but we can still get here if a partitioned table has a
-			 * foreign table as partition.  Disallow that now, to avoid an
-			 * uglier error message later.
-			 */
-			if (operation == CMD_MERGE && fdwroutine != NULL)
-			{
-				RangeTblEntry *rte = root->simple_rte_array[rti];
-
-				ereport(ERROR,
-						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot execute MERGE on relation \"%s\"",
-							   get_rel_name(rte->relid)),
-						errdetail_relkind_not_supported(rte->relkind));
-			}
-
 		}
 		else
 		{
 			RangeTblEntry *rte = planner_rt_fetch(rti, root);
 
-			Assert(rte->rtekind == RTE_RELATION);
-			Assert(operation != CMD_MERGE);
-			if (rte->relkind == RELKIND_FOREIGN_TABLE)
+			if (rte->rtekind == RTE_RELATION &&
+				rte->relkind == RELKIND_FOREIGN_TABLE)
+			{
+				/* Check if the access to foreign tables is restricted */
+				if (unlikely((restrict_nonsystem_relation_kind & RESTRICT_RELKIND_FOREIGN_TABLE) != 0))
+				{
+					/* there must not be built-in foreign tables */
+					Assert(rte->relid >= FirstNormalObjectId);
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("access to non-system foreign table is restricted")));
+				}
+
 				fdwroutine = GetFdwRoutineByRelId(rte->relid);
+			}
 			else
 				fdwroutine = NULL;
+		}
+
+		/*
+		 * MERGE is not currently supported for foreign tables.  We already
+		 * checked that when the table mentioned in the query is foreign; but
+		 * we can still get here if a partitioned table has a foreign table as
+		 * partition.  Disallow that now, to avoid an uglier error message
+		 * later.
+		 */
+		if (operation == CMD_MERGE && fdwroutine != NULL)
+		{
+			RangeTblEntry *rte = planner_rt_fetch(rti, root);
+
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot execute MERGE on relation \"%s\"",
+						   get_rel_name(rte->relid)),
+					errdetail_relkind_not_supported(rte->relkind));
 		}
 
 		/*

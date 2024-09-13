@@ -74,9 +74,6 @@ pgxml_parser_init(PgXmlStrictness strictness)
 	/* Initialize libxml */
 	xmlInitParser();
 
-	xmlSubstituteEntitiesDefault(1);
-	xmlLoadExtDtdDefaultValue = 1;
-
 	return xmlerrcxt;
 }
 
@@ -380,8 +377,9 @@ pgxml_xpath(text *document, xmlChar *xpath, xpath_workspace *workspace)
 
 	PG_TRY();
 	{
-		workspace->doctree = xmlParseMemory((char *) VARDATA_ANY(document),
-											docsize);
+		workspace->doctree = xmlReadMemory((char *) VARDATA_ANY(document),
+										   docsize, NULL, NULL,
+										   XML_PARSE_NOENT);
 		if (workspace->doctree != NULL)
 		{
 			workspace->ctxt = xmlXPathNewContext(workspace->doctree);
@@ -562,8 +560,7 @@ xpath_table(PG_FUNCTION_ARGS)
 					 relname,
 					 condition);
 
-	if ((ret = SPI_connect()) < 0)
-		elog(ERROR, "xpath_table: SPI_connect returned %d", ret);
+	SPI_connect();
 
 	if ((ret = SPI_exec(query_buf.data, 0)) != SPI_OK_SELECT)
 		elog(ERROR, "xpath_table: SPI execution failed for query %s",
@@ -624,7 +621,9 @@ xpath_table(PG_FUNCTION_ARGS)
 
 			/* Parse the document */
 			if (xmldoc)
-				doctree = xmlParseMemory(xmldoc, strlen(xmldoc));
+				doctree = xmlReadMemory(xmldoc, strlen(xmldoc),
+										NULL, NULL,
+										XML_PARSE_NOENT);
 			else				/* treat NULL as not well-formed */
 				doctree = NULL;
 

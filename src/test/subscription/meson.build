@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 tests += {
   'name': 'subscription',
   'sd': meson.current_source_dir(),
@@ -36,6 +38,8 @@ tests += {
       't/029_on_error.pl',
       't/030_origin.pl',
       't/031_column_list.pl',
+      't/032_subscribe_use_index.pl',
+      't/033_run_as_table_owner.pl',
       't/100_bugs.pl',
     ],
   },

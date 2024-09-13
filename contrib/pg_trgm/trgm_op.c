@@ -6,6 +6,7 @@
 #include <ctype.h>
 
 #include "catalog/pg_type.h"
+#include "common/int.h"
 #include "lib/qunique.h"
 #include "miscadmin.h"
 #include "trgm.h"
@@ -376,7 +377,7 @@ generate_trgm(char *str, int slen)
 	 */
 	if (len > 1)
 	{
-		qsort((void *) GETARR(trg), len, sizeof(trgm), comp_trgm);
+		qsort(GETARR(trg), len, sizeof(trgm), comp_trgm);
 		len = qunique(GETARR(trg), len, sizeof(trgm), comp_trgm);
 	}
 
@@ -433,12 +434,7 @@ comp_ptrgm(const void *v1, const void *v2)
 	if (cmp != 0)
 		return cmp;
 
-	if (p1->index < p2->index)
-		return -1;
-	else if (p1->index == p2->index)
-		return 0;
-	else
-		return 1;
+	return pg_cmp_s32(p1->index, p2->index);
 }
 
 /*
@@ -929,7 +925,7 @@ generate_wildcard_trgm(const char *str, int slen)
 	 */
 	if (len > 1)
 	{
-		qsort((void *) GETARR(trg), len, sizeof(trgm), comp_trgm);
+		qsort(GETARR(trg), len, sizeof(trgm), comp_trgm);
 		len = qunique(GETARR(trg), len, sizeof(trgm), comp_trgm);
 	}
 

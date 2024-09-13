@@ -1,3 +1,7 @@
+-- This test script fails if debug_discard_caches is enabled, because cache
+-- flushes cause extra calls of the OAT hook in recomputeNamespacePath,
+-- resulting in more NOTICE messages than are in the expected output.
+SET debug_discard_caches = 0;
 -- Creating privileges on a placeholder GUC should create entries in the
 -- pg_parameter_acl catalog which conservatively grant no privileges to public.
 CREATE ROLE regress_role_joe;
@@ -85,11 +89,15 @@ NOTICE:  in object access: superuser finished create (subId=0x0) [internal]
 NOTICE:  in process utility: superuser finished CREATE TABLE
 CREATE INDEX regress_test_table_t_idx ON regress_test_table (t);
 NOTICE:  in process utility: superuser attempting CREATE INDEX
+NOTICE:  in object access: superuser attempting namespace search (subId=0x0) [no report on violation, allowed]
+NOTICE:  in object access: superuser finished namespace search (subId=0x0) [no report on violation, allowed]
 NOTICE:  in object access: superuser attempting create (subId=0x0) [explicit]
 NOTICE:  in object access: superuser finished create (subId=0x0) [explicit]
 NOTICE:  in process utility: superuser finished CREATE INDEX
 GRANT SELECT ON Table regress_test_table TO public;
 NOTICE:  in process utility: superuser attempting GRANT
+NOTICE:  in object access: superuser attempting namespace search (subId=0x0) [no report on violation, allowed]
+NOTICE:  in object access: superuser finished namespace search (subId=0x0) [no report on violation, allowed]
 NOTICE:  in process utility: superuser finished GRANT
 CREATE FUNCTION regress_test_func (t text) RETURNS text AS $$
 	SELECT $1;

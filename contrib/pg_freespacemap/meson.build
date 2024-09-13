@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 pg_freespacemap_sources = files(
   'pg_freespacemap.c',
 )
@@ -33,5 +35,8 @@ tests += {
     'regress_args': [
       '--temp-config', files('pg_freespacemap.conf')
     ],
+    # Disabled because these tests require "autovacuum=off", which
+    # typical runningcheck users do not have (e.g. buildfarm clients).
+    'runningcheck': false,
   },
 }

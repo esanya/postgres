@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 backend_sources += files(
   'autovacuum.c',
   'auxprocess.c',
@@ -6,10 +8,11 @@ backend_sources += files(
   'checkpointer.c',
   'fork_process.c',
   'interrupt.c',
+  'launch_backend.c',
   'pgarch.c',
   'postmaster.c',
-  'shell_archive.c',
   'startup.c',
   'syslogger.c',
+  'walsummarizer.c',
   'walwriter.c',
 )

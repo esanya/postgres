@@ -1,4 +1,4 @@
-# FIXME: prevent install during main install, but not during test :/
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 test_oat_hooks_sources = files(
   'test_oat_hooks.c',
@@ -12,9 +12,9 @@ endif
 
 test_oat_hooks = shared_module('test_oat_hooks',
   test_oat_hooks_sources,
-  kwargs: pg_mod_args,
+  kwargs: pg_test_mod_args,
 )
-testprep_targets += test_oat_hooks
+test_install_libs += test_oat_hooks
 
 tests += {
   'name': 'test_oat_hooks',
@@ -23,7 +23,9 @@ tests += {
   'regress': {
     'sql': [
       'test_oat_hooks',
+      'alter_table',
     ],
     'regress_args': ['--no-locale', '--encoding=UTF8'],
+    'runningcheck': false,
   },
 }

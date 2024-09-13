@@ -12,7 +12,7 @@
  *	  http://www.ietf.org/rfc/rfc4013.txt
  *
  *
- * Portions Copyright (c) 2017-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2017-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/common/saslprep.c
@@ -1004,15 +1004,17 @@ pg_utf8_string_len(const char *source)
 	const unsigned char *p = (const unsigned char *) source;
 	int			l;
 	int			num_chars = 0;
+	size_t		len = strlen(source);
 
-	while (*p)
+	while (len)
 	{
 		l = pg_utf_mblen(p);
 
-		if (!pg_utf8_islegal(p, l))
+		if (len < l || !pg_utf8_islegal(p, l))
 			return -1;
 
 		p += l;
+		len -= l;
 		num_chars++;
 	}
 

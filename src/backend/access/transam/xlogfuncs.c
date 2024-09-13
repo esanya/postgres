@@ -7,7 +7,7 @@
  * This file contains WAL control and information functions.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xlogfuncs.c
@@ -22,22 +22,17 @@
 #include "access/xlog_internal.h"
 #include "access/xlogbackup.h"
 #include "access/xlogrecovery.h"
-#include "access/xlogutils.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "replication/walreceiver.h"
 #include "storage/fd.h"
-#include "storage/ipc.h"
-#include "storage/smgr.h"
+#include "storage/standby.h"
 #include "utils/builtins.h"
-#include "utils/guc.h"
 #include "utils/memutils.h"
-#include "utils/numeric.h"
 #include "utils/pg_lsn.h"
 #include "utils/timestamp.h"
-#include "utils/tuplestore.h"
 
 /*
  * Backup-related variables.
@@ -197,6 +192,37 @@ pg_switch_wal(PG_FUNCTION_ARGS)
 }
 
 /*
+ * pg_log_standby_snapshot: call LogStandbySnapshot()
+ *
+ * Permission checking for this function is managed through the normal
+ * GRANT system.
+ */
+Datum
+pg_log_standby_snapshot(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	recptr;
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is in progress"),
+				 errhint("%s cannot be executed during recovery.",
+						 "pg_log_standby_snapshot()")));
+
+	if (!XLogStandbyInfoActive())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_log_standby_snapshot() can only be used if \"wal_level\" >= \"replica\"")));
+
+	recptr = LogStandbySnapshot();
+
+	/*
+	 * As a convenience, return the WAL location of the last inserted record
+	 */
+	PG_RETURN_LSN(recptr);
+}
+
+/*
  * pg_create_restore_point: a named point for restore
  *
  * Permission checking for this function is managed through the normal
@@ -219,7 +245,7 @@ pg_create_restore_point(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("WAL level not sufficient for creating a restore point"),
-				 errhint("wal_level must be set to \"replica\" or \"logical\" at server start.")));
+				 errhint("\"wal_level\" must be set to \"replica\" or \"logical\" at server start.")));
 
 	restore_name_str = text_to_cstring(restore_name);
 
@@ -342,10 +368,6 @@ pg_last_wal_replay_lsn(PG_FUNCTION_ARGS)
 /*
  * Compute an xlog file name and decimal byte offset given a WAL location,
  * such as is returned by pg_backup_stop() or pg_switch_wal().
- *
- * Note that a location exactly at a segment boundary is taken to be in
- * the previous segment.  This is usually the right thing, since the
- * expected usage is to determine which xlog file(s) are ready to archive.
  */
 Datum
 pg_walfile_name_offset(PG_FUNCTION_ARGS)
@@ -382,7 +404,7 @@ pg_walfile_name_offset(PG_FUNCTION_ARGS)
 	/*
 	 * xlogfilename
 	 */
-	XLByteToPrevSeg(locationpoint, xlogsegno, wal_segment_size);
+	XLByteToSeg(locationpoint, xlogsegno, wal_segment_size);
 	XLogFileName(xlogfilename, GetWALInsertionTimeLine(), xlogsegno,
 				 wal_segment_size);
 
@@ -425,11 +447,64 @@ pg_walfile_name(PG_FUNCTION_ARGS)
 				 errhint("%s cannot be executed during recovery.",
 						 "pg_walfile_name()")));
 
-	XLByteToPrevSeg(locationpoint, xlogsegno, wal_segment_size);
+	XLByteToSeg(locationpoint, xlogsegno, wal_segment_size);
 	XLogFileName(xlogfilename, GetWALInsertionTimeLine(), xlogsegno,
 				 wal_segment_size);
 
 	PG_RETURN_TEXT_P(cstring_to_text(xlogfilename));
+}
+
+/*
+ * Extract the sequence number and the timeline ID from given a WAL file
+ * name.
+ */
+Datum
+pg_split_walfile_name(PG_FUNCTION_ARGS)
+{
+#define PG_SPLIT_WALFILE_NAME_COLS 2
+	char	   *fname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *fname_upper;
+	char	   *p;
+	TimeLineID	tli;
+	XLogSegNo	segno;
+	Datum		values[PG_SPLIT_WALFILE_NAME_COLS] = {0};
+	bool		isnull[PG_SPLIT_WALFILE_NAME_COLS] = {0};
+	TupleDesc	tupdesc;
+	HeapTuple	tuple;
+	char		buf[256];
+	Datum		result;
+
+	fname_upper = pstrdup(fname);
+
+	/* Capitalize WAL file name. */
+	for (p = fname_upper; *p; p++)
+		*p = pg_toupper((unsigned char) *p);
+
+	if (!IsXLogFileName(fname_upper))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid WAL file name \"%s\"", fname)));
+
+	XLogFromFileName(fname_upper, &tli, &segno, wal_segment_size);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	/* Convert to numeric. */
+	snprintf(buf, sizeof buf, UINT64_FORMAT, segno);
+	values[0] = DirectFunctionCall3(numeric_in,
+									CStringGetDatum(buf),
+									ObjectIdGetDatum(0),
+									Int32GetDatum(-1));
+
+	values[1] = Int64GetDatum(tli);
+
+	tuple = heap_form_tuple(tupdesc, values, isnull);
+	result = HeapTupleGetDatum(tuple);
+
+	PG_RETURN_DATUM(result);
+
+#undef PG_SPLIT_WALFILE_NAME_COLS
 }
 
 /*
@@ -626,10 +701,10 @@ pg_promote(PG_FUNCTION_ARGS)
 	/* signal the postmaster */
 	if (kill(PostmasterPid, SIGUSR1) != 0)
 	{
-		ereport(WARNING,
-				(errmsg("failed to send signal to postmaster: %m")));
 		(void) unlink(PROMOTE_SIGNAL_FILE);
-		PG_RETURN_BOOL(false);
+		ereport(ERROR,
+				(errcode(ERRCODE_SYSTEM_ERROR),
+				 errmsg("failed to send signal to postmaster: %m")));
 	}
 
 	/* return immediately if waiting was not requested */
@@ -659,7 +734,10 @@ pg_promote(PG_FUNCTION_ARGS)
 		 * necessity for manual cleanup of all postmaster children.
 		 */
 		if (rc & WL_POSTMASTER_DEATH)
-			PG_RETURN_BOOL(false);
+			ereport(FATAL,
+					(errcode(ERRCODE_ADMIN_SHUTDOWN),
+					 errmsg("terminating connection due to unexpected postmaster exit"),
+					 errcontext("while waiting on promotion")));
 	}
 
 	ereport(WARNING,

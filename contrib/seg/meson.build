@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 seg_sources = files(
   'seg.c',
 )
@@ -51,6 +53,7 @@ tests += {
   'bd': meson.current_build_dir(),
   'regress': {
     'sql': [
+      'security',
       'seg',
     ],
   },

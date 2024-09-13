@@ -8,7 +8,7 @@
  * storage implementation and the details about individual types of
  * statistics.
  *
- * Copyright (c) 2001-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_bgwriter.c
@@ -24,7 +24,7 @@ PgStat_BgWriterStats PendingBgWriterStats = {0};
 
 
 /*
- * Report bgwriter statistics
+ * Report bgwriter and IO statistics
  */
 void
 pgstat_report_bgwriter(void)
@@ -56,6 +56,11 @@ pgstat_report_bgwriter(void)
 	 * Clear out the statistics buffer, so it can be re-used.
 	 */
 	MemSet(&PendingBgWriterStats, 0, sizeof(PendingBgWriterStats));
+
+	/*
+	 * Report IO statistics
+	 */
+	pgstat_flush_io(false);
 }
 
 /*
@@ -68,6 +73,14 @@ pgstat_fetch_stat_bgwriter(void)
 	pgstat_snapshot_fixed(PGSTAT_KIND_BGWRITER);
 
 	return &pgStatLocal.snapshot.bgwriter;
+}
+
+void
+pgstat_bgwriter_init_shmem_cb(void *stats)
+{
+	PgStatShared_BgWriter *stats_shmem = (PgStatShared_BgWriter *) stats;
+
+	LWLockInitialize(&stats_shmem->lock, LWTRANCHE_PGSTATS_DATA);
 }
 
 void

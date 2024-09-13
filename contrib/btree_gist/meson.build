@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 btree_gist_sources = files(
   'btree_bit.c',
   'btree_bool.c',
@@ -86,6 +88,7 @@ tests += {
       'not_equal',
       'enum',
       'bool',
+      'partitions',
     ],
   },
 }

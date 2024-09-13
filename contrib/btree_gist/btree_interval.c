@@ -113,7 +113,7 @@ static const gbtree_ninfo tinfo =
 Interval *
 abs_interval(Interval *a)
 {
-	static Interval zero = {0, 0, 0};
+	static const Interval zero = {0, 0, 0};
 
 	if (DatumGetBool(DirectFunctionCall2(interval_lt,
 										 IntervalPGetDatum(a),
@@ -157,8 +157,8 @@ gbt_intv_compress(PG_FUNCTION_ARGS)
 		{
 			Interval   *key = DatumGetIntervalP(entry->key);
 
-			memcpy((void *) r, (void *) key, INTERVALSIZE);
-			memcpy((void *) (r + INTERVALSIZE), (void *) key, INTERVALSIZE);
+			memcpy(r, key, INTERVALSIZE);
+			memcpy(r + INTERVALSIZE, key, INTERVALSIZE);
 		}
 		else
 		{

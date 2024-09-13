@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 # used by frontend programs like pg_waldump
 rmgr_desc_sources = files(
   'brindesc.c',
@@ -14,6 +16,7 @@ rmgr_desc_sources = files(
   'nbtdesc.c',
   'relmapdesc.c',
   'replorigindesc.c',
+  'rmgrdesc_utils.c',
   'seqdesc.c',
   'smgrdesc.c',
   'spgdesc.c',

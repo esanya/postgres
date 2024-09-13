@@ -1,7 +1,10 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 pgc_files = [
   'charfuncs',
   'dec_test',
   'describe',
+  'intoasc',
   'rfmtdate',
   'rfmtlong',
   'rnull',

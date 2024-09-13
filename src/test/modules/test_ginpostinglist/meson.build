@@ -1,4 +1,4 @@
-# FIXME: prevent install during main install, but not during test :/
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 test_ginpostinglist_sources = files(
   'test_ginpostinglist.c',
@@ -12,14 +12,13 @@ endif
 
 test_ginpostinglist = shared_module('test_ginpostinglist',
   test_ginpostinglist_sources,
-  kwargs: pg_mod_args,
+  kwargs: pg_test_mod_args,
 )
-testprep_targets += test_ginpostinglist
+test_install_libs += test_ginpostinglist
 
-install_data(
+test_install_data += files(
   'test_ginpostinglist.control',
   'test_ginpostinglist--1.0.sql',
-  kwargs: contrib_data_args,
 )
 
 tests += {

@@ -11,7 +11,7 @@
  * subplans, which are re-evaluated every time their result is required.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -107,7 +107,7 @@ ExecHashSubPlan(SubPlanState *node,
 	TupleTableSlot *slot;
 
 	/* Shouldn't have any direct correlation Vars */
-	if (subplan->parParam != NIL || node->args != NIL)
+	if (subplan->parParam != NIL || subplan->args != NIL)
 		elog(ERROR, "hashed subplan with direct correlation not supported");
 
 	/*
@@ -231,50 +231,8 @@ ExecScanSubPlan(SubPlanState *node,
 	TupleTableSlot *slot;
 	Datum		result;
 	bool		found = false;	/* true if got at least one subplan tuple */
-	ListCell   *pvar;
 	ListCell   *l;
 	ArrayBuildStateAny *astate = NULL;
-
-	/*
-	 * MULTIEXPR subplans, when "executed", just return NULL; but first we
-	 * mark the subplan's output parameters as needing recalculation.  (This
-	 * is a bit of a hack: it relies on the subplan appearing later in its
-	 * targetlist than any of the referencing Params, so that all the Params
-	 * have been evaluated before we re-mark them for the next evaluation
-	 * cycle.  But in general resjunk tlist items appear after non-resjunk
-	 * ones, so this should be safe.)  Unlike ExecReScanSetParamPlan, we do
-	 * *not* set bits in the parent plan node's chgParam, because we don't
-	 * want to cause a rescan of the parent.
-	 *
-	 * Note: we are also relying on MULTIEXPR SubPlans not sharing any output
-	 * parameters with other SubPlans, because if one does then it is unclear
-	 * which SubPlanState node the parameter's execPlan field will be pointing
-	 * to when we come to evaluate the parameter.  We can allow plain initplan
-	 * SubPlans to share output parameters, because it doesn't actually matter
-	 * which initplan SubPlan we reference as long as they all point to the
-	 * same underlying subplan.  However, that fails to hold for MULTIEXPRs
-	 * because they can have non-empty args lists, and the "same" args might
-	 * have mutated into different forms in different parts of a plan tree.
-	 * There is currently no problem because MULTIEXPR can appear only in an
-	 * UPDATE's top-level target list, so it won't get duplicated anyplace.
-	 * Postgres versions before v14 had to make concrete efforts to avoid
-	 * sharing output parameters across different clones of a MULTIEXPR, and
-	 * the problem could recur someday.
-	 */
-	if (subLinkType == MULTIEXPR_SUBLINK)
-	{
-		EState	   *estate = node->parent->state;
-
-		foreach(l, subplan->setParam)
-		{
-			int			paramid = lfirst_int(l);
-			ParamExecData *prm = &(estate->es_param_exec_vals[paramid]);
-
-			prm->execPlan = node;
-		}
-		*isNull = true;
-		return (Datum) 0;
-	}
 
 	/* Initialize ArrayBuildStateAny in caller's context, if needed */
 	if (subLinkType == ARRAY_SUBLINK)
@@ -289,26 +247,19 @@ ExecScanSubPlan(SubPlanState *node,
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
 
 	/*
-	 * Set Params of this plan from parent plan correlation values. (Any
-	 * calculation we have to do is done in the parent econtext, since the
-	 * Param values don't need to have per-query lifetime.)
+	 * We rely on the caller to evaluate plan correlation values, if
+	 * necessary. However we still need to record the fact that the values
+	 * (might have) changed, otherwise the ExecReScan() below won't know that
+	 * nodes need to be rescanned.
 	 */
-	Assert(list_length(subplan->parParam) == list_length(node->args));
-
-	forboth(l, subplan->parParam, pvar, node->args)
+	foreach(l, subplan->parParam)
 	{
 		int			paramid = lfirst_int(l);
-		ParamExecData *prm = &(econtext->ecxt_param_exec_vals[paramid]);
 
-		prm->value = ExecEvalExprSwitchContext((ExprState *) lfirst(pvar),
-											   econtext,
-											   &(prm->isnull));
 		planstate->chgParam = bms_add_member(planstate->chgParam, paramid);
 	}
 
-	/*
-	 * Now that we've set up its parameters, we can reset the subplan.
-	 */
+	/* with that done, we can reset the subplan */
 	ExecReScan(planstate);
 
 	/*
@@ -326,6 +277,11 @@ ExecScanSubPlan(SubPlanState *node,
 	 * tuple, else an error is raised.  If zero tuples are produced, we return
 	 * NULL.  Assuming we get a tuple, we just use its first column (there can
 	 * be only one non-junk column in this case).
+	 *
+	 * For MULTIEXPR_SUBLINK, we push the per-column subplan outputs out to
+	 * the setParams and then return a dummy false value.  There must not be
+	 * multiple tuples returned from the subplan; if zero tuples are produced,
+	 * set the setParams to NULL.
 	 *
 	 * For ARRAY_SUBLINK we allow the subplan to produce any number of tuples,
 	 * and form an array of the first column's values.  Note in particular
@@ -374,6 +330,47 @@ ExecScanSubPlan(SubPlanState *node,
 			node->curTuple = ExecCopySlotHeapTuple(slot);
 
 			result = heap_getattr(node->curTuple, 1, tdesc, isNull);
+			/* keep scanning subplan to make sure there's only one tuple */
+			continue;
+		}
+
+		if (subLinkType == MULTIEXPR_SUBLINK)
+		{
+			/* cannot allow multiple input tuples for MULTIEXPR sublink */
+			if (found)
+				ereport(ERROR,
+						(errcode(ERRCODE_CARDINALITY_VIOLATION),
+						 errmsg("more than one row returned by a subquery used as an expression")));
+			found = true;
+
+			/*
+			 * We need to copy the subplan's tuple in case any result is of
+			 * pass-by-ref type --- our output values will point into this
+			 * copied tuple!  Can't use the subplan's instance of the tuple
+			 * since it won't still be valid after next ExecProcNode() call.
+			 * node->curTuple keeps track of the copied tuple for eventual
+			 * freeing.
+			 */
+			if (node->curTuple)
+				heap_freetuple(node->curTuple);
+			node->curTuple = ExecCopySlotHeapTuple(slot);
+
+			/*
+			 * Now set all the setParam params from the columns of the tuple
+			 */
+			col = 1;
+			foreach(plst, subplan->setParam)
+			{
+				int			paramid = lfirst_int(plst);
+				ParamExecData *prmdata;
+
+				prmdata = &(econtext->ecxt_param_exec_vals[paramid]);
+				Assert(prmdata->execPlan == NULL);
+				prmdata->value = heap_getattr(node->curTuple, col, tdesc,
+											  &(prmdata->isnull));
+				col++;
+			}
+
 			/* keep scanning subplan to make sure there's only one tuple */
 			continue;
 		}
@@ -472,6 +469,20 @@ ExecScanSubPlan(SubPlanState *node,
 		{
 			result = (Datum) 0;
 			*isNull = true;
+		}
+		else if (subLinkType == MULTIEXPR_SUBLINK)
+		{
+			/* We don't care about function result, but set the setParams */
+			foreach(l, subplan->setParam)
+			{
+				int			paramid = lfirst_int(l);
+				ParamExecData *prmdata;
+
+				prmdata = &(econtext->ecxt_param_exec_vals[paramid]);
+				Assert(prmdata->execPlan == NULL);
+				prmdata->value = (Datum) 0;
+				prmdata->isnull = true;
+			}
 		}
 	}
 
@@ -798,6 +809,10 @@ slotNoNulls(TupleTableSlot *slot)
  * as well as regular SubPlans.  Note that we don't link the SubPlan into
  * the parent's subPlan list, because that shouldn't happen for InitPlans.
  * Instead, ExecInitExpr() does that one part.
+ *
+ * We also rely on ExecInitExpr(), more precisely ExecInitSubPlanExpr(), to
+ * evaluate input parameters, as that allows them to be evaluated as part of
+ * the expression referencing the SubPlan.
  * ----------------------------------------------------------------
  */
 SubPlanState *
@@ -825,7 +840,6 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 
 	/* Initialize subexpressions */
 	sstate->testexpr = ExecInitExpr((Expr *) subplan->testexpr, parent);
-	sstate->args = ExecInitExprList(subplan->args, parent);
 
 	/*
 	 * initialize my state
@@ -848,10 +862,9 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 	sstate->cur_eq_funcs = NULL;
 
 	/*
-	 * If this is an initplan or MULTIEXPR subplan, it has output parameters
-	 * that the parent plan will use, so mark those parameters as needing
-	 * evaluation.  We don't actually run the subplan until we first need one
-	 * of its outputs.
+	 * If this is an initplan, it has output parameters that the parent plan
+	 * will use, so mark those parameters as needing evaluation.  We don't
+	 * actually run the subplan until we first need one of its outputs.
 	 *
 	 * A CTE subplan's output parameter is never to be evaluated in the normal
 	 * way, so skip this in that case.
@@ -859,7 +872,8 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 	 * Note that we don't set parent->chgParam here: the parent plan hasn't
 	 * been run yet, so no need to force it to re-run.
 	 */
-	if (subplan->setParam != NIL && subplan->subLinkType != CTE_SUBLINK)
+	if (subplan->setParam != NIL && subplan->parParam == NIL &&
+		subplan->subLinkType != CTE_SUBLINK)
 	{
 		ListCell   *lst;
 
@@ -1079,7 +1093,6 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 	ScanDirection dir = estate->es_direction;
 	MemoryContext oldcontext;
 	TupleTableSlot *slot;
-	ListCell   *pvar;
 	ListCell   *l;
 	bool		found = false;
 	ArrayBuildStateAny *astate = NULL;
@@ -1089,6 +1102,8 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 		elog(ERROR, "ANY/ALL subselect unsupported as initplan");
 	if (subLinkType == CTE_SUBLINK)
 		elog(ERROR, "CTE subplans should not be executed via ExecSetParamPlan");
+	if (subplan->parParam || subplan->args)
+		elog(ERROR, "correlated subplans should not be executed via ExecSetParamPlan");
 
 	/*
 	 * Enforce forward scan direction regardless of caller. It's hard but not
@@ -1105,26 +1120,6 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 	 * Must switch to per-query memory context.
 	 */
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
-
-	/*
-	 * Set Params of this plan from parent plan correlation values. (Any
-	 * calculation we have to do is done in the parent econtext, since the
-	 * Param values don't need to have per-query lifetime.)  Currently, we
-	 * expect only MULTIEXPR_SUBLINK plans to have any correlation values.
-	 */
-	Assert(subplan->parParam == NIL || subLinkType == MULTIEXPR_SUBLINK);
-	Assert(list_length(subplan->parParam) == list_length(node->args));
-
-	forboth(l, subplan->parParam, pvar, node->args)
-	{
-		int			paramid = lfirst_int(l);
-		ParamExecData *prm = &(econtext->ecxt_param_exec_vals[paramid]);
-
-		prm->value = ExecEvalExprSwitchContext((ExprState *) lfirst(pvar),
-											   econtext,
-											   &(prm->isnull));
-		planstate->chgParam = bms_add_member(planstate->chgParam, paramid);
-	}
 
 	/*
 	 * Run the plan.  (If it needs to be rescanned, the first ExecProcNode

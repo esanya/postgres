@@ -259,6 +259,13 @@ pgstat_relation(Relation rel, FunctionCallInfo fcinfo)
 	}
 	else if (rel->rd_rel->relkind == RELKIND_INDEX)
 	{
+		/* see pgstatindex_impl */
+		if (!rel->rd_index->indisvalid)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("index \"%s\" is not valid",
+							RelationGetRelationName(rel))));
+
 		switch (rel->rd_rel->relam)
 		{
 			case BTREE_AM_OID:
@@ -316,7 +323,11 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 	pgstattuple_type stat = {0};
 	SnapshotData SnapshotDirty;
 
-	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+	/*
+	 * Sequences always use heap AM, but they don't show that in the catalogs.
+	 */
+	if (rel->rd_rel->relkind != RELKIND_SEQUENCE &&
+		rel->rd_rel->relam != HEAP_TABLE_AM_OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("only heap AM is supported")));
@@ -365,7 +376,7 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, block,
 										RBM_NORMAL, hscan->rs_strategy);
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
-			stat.free_space += PageGetHeapFreeSpace((Page) BufferGetPage(buffer));
+			stat.free_space += PageGetExactFreeSpace((Page) BufferGetPage(buffer));
 			UnlockReleaseBuffer(buffer);
 			block++;
 		}
@@ -378,7 +389,7 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, block,
 									RBM_NORMAL, hscan->rs_strategy);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
-		stat.free_space += PageGetHeapFreeSpace((Page) BufferGetPage(buffer));
+		stat.free_space += PageGetExactFreeSpace((Page) BufferGetPage(buffer));
 		UnlockReleaseBuffer(buffer);
 		block++;
 	}
@@ -558,7 +569,7 @@ pgstat_index_page(pgstattuple_type *stat, Page page,
 {
 	OffsetNumber i;
 
-	stat->free_space += PageGetFreeSpace(page);
+	stat->free_space += PageGetExactFreeSpace(page);
 
 	for (i = minoff; i <= maxoff; i = OffsetNumberNext(i))
 	{

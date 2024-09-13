@@ -3,7 +3,7 @@
  * pg_subscription.c
  *		replication subscriptions
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,13 +18,11 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
-#include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
-#include "nodes/makefuncs.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -71,13 +69,14 @@ GetSubscription(Oid subid, bool missing_ok)
 	sub->stream = subform->substream;
 	sub->twophasestate = subform->subtwophasestate;
 	sub->disableonerr = subform->subdisableonerr;
+	sub->passwordrequired = subform->subpasswordrequired;
+	sub->runasowner = subform->subrunasowner;
+	sub->failover = subform->subfailover;
 
 	/* Get conninfo */
-	datum = SysCacheGetAttr(SUBSCRIPTIONOID,
-							tup,
-							Anum_pg_subscription_subconninfo,
-							&isnull);
-	Assert(!isnull);
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_subconninfo);
 	sub->conninfo = TextDatumGetCString(datum);
 
 	/* Get slotname */
@@ -91,28 +90,25 @@ GetSubscription(Oid subid, bool missing_ok)
 		sub->slotname = NULL;
 
 	/* Get synccommit */
-	datum = SysCacheGetAttr(SUBSCRIPTIONOID,
-							tup,
-							Anum_pg_subscription_subsynccommit,
-							&isnull);
-	Assert(!isnull);
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_subsynccommit);
 	sub->synccommit = TextDatumGetCString(datum);
 
 	/* Get publications */
-	datum = SysCacheGetAttr(SUBSCRIPTIONOID,
-							tup,
-							Anum_pg_subscription_subpublications,
-							&isnull);
-	Assert(!isnull);
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_subpublications);
 	sub->publications = textarray_to_stringlist(DatumGetArrayTypeP(datum));
 
 	/* Get origin */
-	datum = SysCacheGetAttr(SUBSCRIPTIONOID,
-							tup,
-							Anum_pg_subscription_suborigin,
-							&isnull);
-	Assert(!isnull);
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_suborigin);
 	sub->origin = TextDatumGetCString(datum);
+
+	/* Is the subscription owner a superuser? */
+	sub->ownersuperuser = superuser_arg(sub->owner);
 
 	ReleaseSysCache(tup);
 
@@ -231,10 +227,14 @@ textarray_to_stringlist(ArrayType *textarray)
 
 /*
  * Add new state record for a subscription table.
+ *
+ * If retain_lock is true, then don't release the locks taken in this function.
+ * We normally release the locks at the end of transaction but in binary-upgrade
+ * mode, we expect to release those immediately.
  */
 void
 AddSubscriptionRelState(Oid subid, Oid relid, char state,
-						XLogRecPtr sublsn)
+						XLogRecPtr sublsn, bool retain_lock)
 {
 	Relation	rel;
 	HeapTuple	tup;
@@ -272,7 +272,15 @@ AddSubscriptionRelState(Oid subid, Oid relid, char state,
 	heap_freetuple(tup);
 
 	/* Cleanup. */
-	table_close(rel, NoLock);
+	if (retain_lock)
+	{
+		table_close(rel, NoLock);
+	}
+	else
+	{
+		table_close(rel, RowExclusiveLock);
+		UnlockSharedObject(SubscriptionRelationId, subid, 0, AccessShareLock);
+	}
 }
 
 /*

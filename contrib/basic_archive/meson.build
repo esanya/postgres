@@ -1,3 +1,5 @@
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+
 basic_archive_sources = files(
   'basic_archive.c',
 )
@@ -25,5 +27,8 @@ tests += {
     'regress_args': [
       '--temp-config', files('basic_archive.conf'),
     ],
+    # Disabled because these tests require special configuration, which
+    # typical installcheck users do not have (e.g. buildfarm clients).
+    'runningcheck': false,
   },
 }

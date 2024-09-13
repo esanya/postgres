@@ -72,7 +72,7 @@ static inet *internal_inetpl(inet *ip, int64 addend);
  * Common INET/CIDR input routine
  */
 static inet *
-network_in(char *src, bool is_cidr)
+network_in(char *src, bool is_cidr, Node *escontext)
 {
 	int			bits;
 	inet	   *dst;
@@ -93,7 +93,7 @@ network_in(char *src, bool is_cidr)
 	bits = pg_inet_net_pton(ip_family(dst), src, ip_addr(dst),
 							is_cidr ? ip_addrsize(dst) : -1);
 	if ((bits < 0) || (bits > ip_maxbits(dst)))
-		ereport(ERROR,
+		ereturn(escontext, NULL,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 		/* translator: first %s is inet or cidr */
 				 errmsg("invalid input syntax for type %s: \"%s\"",
@@ -105,7 +105,7 @@ network_in(char *src, bool is_cidr)
 	if (is_cidr)
 	{
 		if (!addressOK(ip_addr(dst), bits, ip_family(dst)))
-			ereport(ERROR,
+			ereturn(escontext, NULL,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid cidr value: \"%s\"", src),
 					 errdetail("Value has bits set to right of mask.")));
@@ -122,7 +122,7 @@ inet_in(PG_FUNCTION_ARGS)
 {
 	char	   *src = PG_GETARG_CSTRING(0);
 
-	PG_RETURN_INET_P(network_in(src, false));
+	PG_RETURN_INET_P(network_in(src, false, fcinfo->context));
 }
 
 Datum
@@ -130,7 +130,7 @@ cidr_in(PG_FUNCTION_ARGS)
 {
 	char	   *src = PG_GETARG_CSTRING(0);
 
-	PG_RETURN_INET_P(network_in(src, true));
+	PG_RETURN_INET_P(network_in(src, true, fcinfo->context));
 }
 
 
@@ -503,13 +503,11 @@ network_abbrev_abort(int memtupcount, SortSupport ssup)
 	 */
 	if (abbr_card > 100000.0)
 	{
-#ifdef TRACE_SORT
 		if (trace_sort)
 			elog(LOG,
 				 "network_abbrev: estimation ends at cardinality %f"
 				 " after " INT64_FORMAT " values (%d rows)",
 				 abbr_card, uss->input_count, memtupcount);
-#endif
 		uss->estimating = false;
 		return false;
 	}
@@ -522,23 +520,19 @@ network_abbrev_abort(int memtupcount, SortSupport ssup)
 	 */
 	if (abbr_card < uss->input_count / 2000.0 + 0.5)
 	{
-#ifdef TRACE_SORT
 		if (trace_sort)
 			elog(LOG,
 				 "network_abbrev: aborting abbreviation at cardinality %f"
 				 " below threshold %f after " INT64_FORMAT " values (%d rows)",
 				 abbr_card, uss->input_count / 2000.0 + 0.5, uss->input_count,
 				 memtupcount);
-#endif
 		return true;
 	}
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG,
 			 "network_abbrev: cardinality %f after " INT64_FORMAT
 			 " values (%d rows)", abbr_card, uss->input_count, memtupcount);
-#endif
 
 	return false;
 }
@@ -1742,7 +1736,7 @@ inet_client_addr(PG_FUNCTION_ARGS)
 
 	clean_ipv6_addr(port->raddr.addr.ss_family, remote_host);
 
-	PG_RETURN_INET_P(network_in(remote_host, false));
+	PG_RETURN_INET_P(network_in(remote_host, false, NULL));
 }
 
 
@@ -1814,7 +1808,7 @@ inet_server_addr(PG_FUNCTION_ARGS)
 
 	clean_ipv6_addr(port->laddr.addr.ss_family, local_host);
 
-	PG_RETURN_INET_P(network_in(local_host, false));
+	PG_RETURN_INET_P(network_in(local_host, false, NULL));
 }
 
 
@@ -1866,7 +1860,7 @@ inetnot(PG_FUNCTION_ARGS)
 		unsigned char *pip = ip_addr(ip);
 		unsigned char *pdst = ip_addr(dst);
 
-		while (nb-- > 0)
+		while (--nb >= 0)
 			pdst[nb] = ~pip[nb];
 	}
 	ip_bits(dst) = ip_bits(ip);
@@ -1898,7 +1892,7 @@ inetand(PG_FUNCTION_ARGS)
 		unsigned char *pip2 = ip_addr(ip2);
 		unsigned char *pdst = ip_addr(dst);
 
-		while (nb-- > 0)
+		while (--nb >= 0)
 			pdst[nb] = pip[nb] & pip2[nb];
 	}
 	ip_bits(dst) = Max(ip_bits(ip), ip_bits(ip2));
@@ -1930,7 +1924,7 @@ inetor(PG_FUNCTION_ARGS)
 		unsigned char *pip2 = ip_addr(ip2);
 		unsigned char *pdst = ip_addr(dst);
 
-		while (nb-- > 0)
+		while (--nb >= 0)
 			pdst[nb] = pip[nb] | pip2[nb];
 	}
 	ip_bits(dst) = Max(ip_bits(ip), ip_bits(ip2));
@@ -1955,7 +1949,7 @@ internal_inetpl(inet *ip, int64 addend)
 		unsigned char *pdst = ip_addr(dst);
 		int			carry = 0;
 
-		while (nb-- > 0)
+		while (--nb >= 0)
 		{
 			carry = pip[nb] + (int) (addend & 0xFF) + carry;
 			pdst[nb] = (unsigned char) (carry & 0xFF);
@@ -2039,7 +2033,7 @@ inetmi(PG_FUNCTION_ARGS)
 		unsigned char *pip2 = ip_addr(ip2);
 		int			carry = 1;
 
-		while (nb-- > 0)
+		while (--nb >= 0)
 		{
 			int			lobyte;
 
